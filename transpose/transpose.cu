@@ -1,5 +1,6 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
+#include <climits>
 #include <cstddef>
 #include<iostream>
 #include <limits>
@@ -441,12 +442,10 @@ float  cublasTransposeMatrix(const Matrix<T>& inputMatrix, Matrix<T>& outputMatr
     return elapsed_time;
 }
 
-float test_cublasTransposeMatrix()
+float test_cublasTransposeMatrix(size_t row =1024,size_t col =1024)
 {
     float elapsed_time = 0.0f;
     using value_type = float;
-    size_t row = 1024;
-    size_t col = 1024;
     auto matrix = generateMatrix<value_type>(row,col);
     Matrix<value_type>  result(matrix.col(),matrix.row());
 
@@ -492,9 +491,9 @@ auto  test_kernel(F kernel,size_t row=1024,size_t col =1024,Args... args)
 }
 
 
-float test_copyMatrix()
+float test_copyMatrix(size_t row =1024,size_t col =1024)
 {
-    auto[matrix,result,elapsed_time] = test_kernel(copyMatrix<float>);
+    auto[matrix,result,elapsed_time] = test_kernel(copyMatrix<float>,row,col);
     if(result != matrix)
     {
         std::cout<<"Copy Matrix is incorrect!"<<std::endl;
@@ -505,9 +504,9 @@ float test_copyMatrix()
 
 
 
-float  test_transpose_base()
+float  test_transpose_base(size_t row =1024,size_t col =1024)
 {
-    auto[matrix,result,elapsed_time] = test_kernel(transposeMatrix_base<float>);
+    auto[matrix,result,elapsed_time] = test_kernel(transposeMatrix_base<float>,row,col);
     if(result != matrix.transpose())
     {
         std::cout<<"transposeMatrix_base  is Incorrect!"<<std::endl;
@@ -517,9 +516,9 @@ float  test_transpose_base()
 
 
 
-float test_transpose_shared()
+float test_transpose_shared(size_t row =1024,size_t col =1024)
 {   
-    auto [OringalMatrix,result,elapsed_time]= test_kernel(transposeMatrix_shared<float>);
+    auto [OringalMatrix,result,elapsed_time]= test_kernel(transposeMatrix_shared<float>,row,col);
     if(result != OringalMatrix.transpose())
     {
         std::cout<<"transposeMatrix_shared  is Incorrect!"<<std::endl;
@@ -531,12 +530,12 @@ float test_transpose_shared()
 
 
 
-#define LOOP_TEST(test_func,n,baseline_time) \
+#define LOOP_TEST(test_func,n,row,col,baseline_time) \
 {\
     float elapsed_time = 0.0f;\
     for(int i=0;i<n;++i)\
     {\
-        elapsed_time += test_func();\
+        elapsed_time += test_func(row,col);\
     }\
     std::cout<<#test_func<<" Average elapsed time: "<<elapsed_time/n<<" ms"<<std::endl;\
     if(baseline_time > 0)\
@@ -545,12 +544,12 @@ float test_transpose_shared()
     }\
 }
 
-#define BASELINE_TEST(test_func,n) \
+#define BASELINE_TEST(test_func,n,row,col) \
 ({\
     float elapsed_time = 0.0f;\
     for(int i=0;i<n;++i)\
     {\
-        elapsed_time += test_func();\
+        elapsed_time += test_func(row,col);\
     }\
     std::cout << #test_func << " average time: " << (elapsed_time / n) << " ms" << std::endl;\
     elapsed_time/n;\
@@ -562,13 +561,23 @@ void loop_test()
     const int N=10;
     //dummy test for warm up
     test_transpose_base();
+    std::vector<int> test_sizes = {32,64,128,256,512,1024,2048,4096,8192};
 
     std::cout<<"Loop test "<<N<<" times"<<std::endl;
 
-    float baseline = BASELINE_TEST(test_transpose_base,N);
-    LOOP_TEST(test_copyMatrix, N,baseline);
-    LOOP_TEST(test_cublasTransposeMatrix, N,baseline);
-    LOOP_TEST(test_transpose_shared, N,baseline);
+    for(auto size : test_sizes)
+    {
+        std::cout<<"Matrix size: "<<size<<"x"<<size<<std::endl;
+        size_t row = size;
+        size_t col = size;
+        float baseline = BASELINE_TEST(test_transpose_base,N,row,col);
+        LOOP_TEST(test_copyMatrix, N,row,col,baseline);
+        LOOP_TEST(test_cublasTransposeMatrix, N,row,col,baseline);
+        LOOP_TEST(test_transpose_shared, N,row,col,baseline);
+        std::cout<<std::endl;
+    }
+
+    
 }
 
 
