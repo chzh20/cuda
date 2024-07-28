@@ -1,5 +1,6 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
+#include <__clang_cuda_builtin_vars.h>
 #include <climits>
 #include <cstddef>
 #include<iostream>
@@ -395,6 +396,24 @@ __global__ void transposeMatrix_shared(T* odata,T* idata,size_t row,size_t col)
     }
 }
 
+/*
+    transpose matrix using stride.
+    one thread deal with mutliple elements.
+    reference: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+*/
+template<typename T = float>
+__global__ void transposeMatrix_stride(T* odata,T* idata,size_t row,size_t col)
+{
+
+    size_t global_index = blockDim.x*blockIdx.x + threadIdx.x;
+    for(size_t i = global_index;i<row*col;i+=blockDim.x*gridDim.x)
+    {
+        size_t xIndex = i / row;
+        size_t yIndex = i % row;
+        odata[xIndex*row+yIndex] = idata[yIndex*col+xIndex];
+    }
+
+}
 
 
 
@@ -527,6 +546,41 @@ float test_transpose_shared(size_t row =1024,size_t col =1024)
 }
 
 
+float test_transpose_stride(size_t row =1024,size_t col =1024)
+{   
+    //auto [OringalMatrix,result,elapsed_time]= test_kernel(transposeMatrix_stride<float>,row,col);
+    float elapsed_time = 0.0f;
+    auto matrix = generateMatrix<float>(row,col);
+    Matrix<float>  result(matrix.row(),matrix.col());
+
+    using VauleType = decltype(matrix)::value_type;
+    size_t byteSize = matrix.row() * matrix.col() * sizeof(VauleType);
+
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),byteSize));
+    CUDACHECK(cudaMemcpy(dev_idata,matrix.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock(512);
+    dim3 blocksPerGrid(512);
+    CudaTimer timer("kernel");
+    timer.startTiming();
+    transposeMatrix_stride<<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,matrix.row(),matrix.col());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+    CUDACHECK(cudaMemcpy(result.data_ptr(),dev_odata,byteSize,cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    if(result != matrix.transpose())
+    {
+        std::cout<<"transposeMatrix_stride  is Incorrect!"<<std::endl;
+    }
+    return elapsed_time;
+}
+
 
 
 
@@ -562,7 +616,6 @@ void loop_test()
     //dummy test for warm up
     test_transpose_base();
     std::vector<int> test_sizes = {32,64,128,256,512,1024,2048,4096,8192};
-
     std::cout<<"Loop test "<<N<<" times"<<std::endl;
 
     for(auto size : test_sizes)
@@ -574,6 +627,7 @@ void loop_test()
         LOOP_TEST(test_copyMatrix, N,row,col,baseline);
         LOOP_TEST(test_cublasTransposeMatrix, N,row,col,baseline);
         LOOP_TEST(test_transpose_shared, N,row,col,baseline);
+        LOOP_TEST(test_transpose_stride, N,row,col,baseline);
         std::cout<<std::endl;
     }
 
