@@ -358,7 +358,7 @@ const int TILE_DIMY = 32;
 template<typename T = float>
 __global__ void transposeMatrix_shared(T* odata,T* idata,size_t row,size_t col)
 {
-    __shared__ T tile[TILE_DIMY][TILE_DIMX];
+    __shared__ T tile[TILE_DIMY][TILE_DIMX+1];
     
     
     // global  thread index in grids;
@@ -416,6 +416,66 @@ __global__ void transposeMatrix_stride(T* odata,T* idata,size_t row,size_t col)
 }
 
 
+template<typename T,size_t TILEDIM =32>
+__global__ void transposeMatrix_shared_2(T * odata, T*idata,size_t row,size_t col)
+{
+    __shared__ T tile[TILEDIM][TILEDIM+1];
+    int  x = blockIdx.x * TILEDIM + threadIdx.x;
+    int  y = blockIdx.y * TILEDIM + threadIdx.y;
+
+    if(x<col && y<row)
+    {
+        tile[threadIdx.y][threadIdx.x] = idata[y*col+x];
+    }
+    __syncthreads();
+
+    x = blockIdx.y * TILEDIM + threadIdx.x;
+    y = blockIdx.x * TILEDIM + threadIdx.y;
+
+    if(x<row && y<col)
+    {
+        odata[y*row+x] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+
+// using shared memory and unroll the loop
+// use less threads in a block and each thread deal with multiple elements.
+// in this case, tile size is 32*32, and block size is 32*8;
+// each thread deals with 4 elements.
+//https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+
+template<typename T,size_t TILEDIM = 32, size_t UNROLL_FACTOR = 4>
+__global__ void transposeMatrix_shared_unroll(T* odata, T* idata, size_t row, size_t col)
+{
+    __shared__ T tile[TILEDIM][TILEDIM+1];
+
+    int x = blockIdx.x *TILEDIM + threadIdx.x;
+    int y = blockIdx.y *TILEDIM + threadIdx.y;
+
+    #pragma unroll
+    for(int i=0; i< UNROLL_FACTOR; ++i)
+    { 
+        if(x<col && y+i<row)
+        {
+            tile[threadIdx.y+i][threadIdx.x] = idata[(y+i)*col+x];
+        }
+       
+    }
+
+    __syncthreads();
+    x = blockIdx.y * TILEDIM + threadIdx.x;
+    y = blockIdx.x * TILEDIM + threadIdx.y;
+    #pragma unroll
+    for(int i=0; i< UNROLL_FACTOR; ++i)
+    { 
+        if(x<row && y+i<col)
+        {
+            odata[(y+i)*row + x] = tile[threadIdx.x][threadIdx.y+i];
+        }
+        
+    }
+}
 
 
 template<typename T> 
@@ -545,6 +605,50 @@ float test_transpose_shared(size_t row =1024,size_t col =1024)
     return elapsed_time;
 }
 
+float test_transpose_shared_2(size_t row =1024,size_t col =1024)
+{   
+    auto [OringalMatrix,result,elapsed] = test_kernel(transposeMatrix_shared_2<float>,row,col);
+    if(result != OringalMatrix.transpose())
+    {
+        std::cout<<"transposeMatrix_shared_2  is Incorrect!"<<std::endl;
+    }
+    return elapsed;
+}
+
+
+float  test_transposeMatrix_shared_unroll(size_t row =1024,size_t col =1024)
+{
+    float elapsed_time = 0.0f;
+    auto matrix = generateMatrix<float>(row,col);
+    Matrix<float>  result(matrix.row(),matrix.col());
+
+    using VauleType = decltype(matrix)::value_type;
+    size_t byteSize = matrix.row() * matrix.col() * sizeof(VauleType);
+
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),byteSize));
+    CUDACHECK(cudaMemcpy(dev_idata,matrix.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    const int TILE_DIM = 32;
+    dim3 threadsPerBlock(TILE_DIM,8);
+    dim3 blocksPerGrid((matrix.col() + TILE_DIM -1) /TILE_DIM,
+                       (matrix.row() + TILE_DIM -1) /TILE_DIM);
+    CudaTimer timer("transposeMatrix_shared_unroll");
+    timer.startTiming();
+    transposeMatrix_shared_unroll<<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,matrix.row(),matrix.col());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+    CUDACHECK(cudaMemcpy(result.data_ptr(),dev_odata,byteSize,cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    return elapsed_time;
+}
+
+
 
 float test_transpose_stride(size_t row =1024,size_t col =1024)
 {   
@@ -612,10 +716,11 @@ float test_transpose_stride(size_t row =1024,size_t col =1024)
 
 void loop_test()
 {
-    const int N=10;
+    const int N=2;
     //dummy test for warm up
     test_transpose_base();
-    std::vector<int> test_sizes = {32,64,128,256,512,1024,2048,4096,8192};
+    //std::vector<int> test_sizes = {32,64,128,256,512,1024,2048,4096,8192};
+    std::vector<int> test_sizes{2048};
     std::cout<<"Loop test "<<N<<" times"<<std::endl;
 
     for(auto size : test_sizes)
@@ -627,7 +732,9 @@ void loop_test()
         LOOP_TEST(test_copyMatrix, N,row,col,baseline);
         LOOP_TEST(test_cublasTransposeMatrix, N,row,col,baseline);
         LOOP_TEST(test_transpose_shared, N,row,col,baseline);
-        LOOP_TEST(test_transpose_stride, N,row,col,baseline);
+        //LOOP_TEST(test_transpose_stride, N,row,col,baseline);
+        LOOP_TEST(test_transpose_shared_2, N,row,col,baseline);
+        LOOP_TEST(test_transposeMatrix_shared_unroll, N, row, col, baseline);
         std::cout<<std::endl;
     }
 
