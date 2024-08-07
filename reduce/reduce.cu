@@ -1,6 +1,5 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
-#include <__clang_cuda_builtin_vars.h>
 #include <climits>
 #include <cstddef>
 #include<iostream>
@@ -160,7 +159,7 @@ public:
         // }
         return m_data[index];
     }
-    std::vector<T>& data() const noexcept
+    std::vector<T> data() const noexcept
     {
         return m_data;
     }
@@ -275,6 +274,19 @@ bool operator != (const Matrix<U> & one,const Matrix<U> &other)  noexcept
     return !(one==other);
 }
 
+// template<typename T, typename C = Matrix<T> >
+// class Vector
+// {
+// public:
+//     Vector(size_t N):{ }
+//     using vaule_type = T;
+
+
+// private:
+//     C m_matrix;
+// }
+
+
 
 template <typename U = int>
 static Matrix<U> generateMatrix(size_t row, size_t col) {
@@ -288,6 +300,10 @@ static Matrix<U> generateMatrix(size_t row, size_t col) {
     }
   }
   return matrix;
+}
+template <typename U = int>
+static Matrix<U> generateVetcor(size_t N) {
+  return generateMatrix(N,1);
 }
 
 
@@ -330,6 +346,9 @@ struct Max{
     __device__ __host__ T operator()(const T &a,const T &b) const
     {
         return a>b?a:b;
+    }
+    __device__ __host__ T operator()(volatile const T &a, volatile const T &b) const {
+        return a > b ? a : b;
     }
 };
 
@@ -378,7 +397,7 @@ void reduce_cpu(T* odata, T* idata,size_t N,OP op)
 // only one block, and one thread to reduce.
 //basic version
 template<typename T,typename OP>
-__global__ void reduce_1(T* odata, T* idata,size_t N, OP op)
+void reduce_1(T* odata, T* idata,size_t N, OP op)
 {
     T result = idata[0];
     for(size_t i = 1;i<N;++i)
@@ -387,6 +406,20 @@ __global__ void reduce_1(T* odata, T* idata,size_t N, OP op)
     }
     *odata = result;
 }
+template<typename T, typename OP>
+T reduce_recursive(T* odata, size_t N,OP op)
+{
+    if(N == 1)  return odata[0];
+
+    int const stride = N/2;
+    for(int i =0; i<stride ;++i)
+    {
+        odata[i] = op(odata[i],odata[i+stride]);
+    }
+
+    return reduce_recursive(odata,stride,op);
+}
+
 
 
 
@@ -420,8 +453,10 @@ __global__ void reduce_2(T* odata, T* idata,size_t N, OP op)
 template<typename T,typename OP>
 __global__ void reduce_3(T* odata, T* idata,size_t N, OP op)
 {
-    size_t tid = threadIdx.x;
-    for(size_t stride = blockDim.x/2 ;stride > 1;stride /= 2)
+    size_t tid = blockIdx.x * blockDim.x+ threadIdx.x;
+    if(tid >= N)
+        return ;
+    for(size_t stride = blockDim.x/2 ;stride >= 1;stride /= 2)
     {
         if(threadIdx.x<stride)
         {
@@ -435,7 +470,179 @@ __global__ void reduce_3(T* odata, T* idata,size_t N, OP op)
     }
 }
 
+template<typename T, typename OP>
+__device__ void wrapReduce(volatile T* data, size_t tid,OP op)
+{
+    T x = data[tid]; // 独立线程调度，导致wrap的线程执行速度不一致。所以使用x,syncwarp 来进行同步
+    if(blockDim.x >= 64)
+    {
+        x = op(x,data[tid+32]); __syncwarp();
+        data[tid] = x;__syncwarp();
+    }
+    x = op(x,data[tid+16]);__syncwarp();
+    data[tid] = x; __syncwarp();
+    x = op(x,data[tid+8]);__syncwarp();
+    data[tid] = x; __syncwarp();
+    x = op(x,data[tid+4]);__syncwarp();
+    data[tid] = x; __syncwarp();
+    x = op(x,data[tid+2]);__syncwarp();
+    data[tid] = x; __syncwarp();
+    x = op(x,data[tid+1]);__syncwarp();
+    data[tid] = x; __syncwarp();
+}
 
+
+
+template<typename T, size_t blockSize, typename OP>
+__global__ void reduce_v4(T* odata, T* indata,size_t N, OP op)
+{
+    __shared__ T smem[blockSize];
+
+    size_t tid = threadIdx.x;
+    size_t global_index = blockIdx.x *(blockSize *2) + threadIdx.x;
+    if(global_index>N) return;
+    smem[tid] = indata[global_index];
+    if(global_index+blockSize<N)
+        smem[tid]+=indata[global_index+blockSize];
+    __syncthreads();
+
+    for(size_t stride = blockDim.x/2 ; stride>32; stride>>=1)
+    {
+        if(tid<stride)
+        {
+            smem[tid]+=smem[tid+stride];
+        }
+        __syncthreads();
+    }
+
+    if(tid<32)
+    {
+        wrapReduce(smem,tid);
+    }
+
+    if(tid ==0)
+    {
+        odata[blockIdx.x] = smem[0];
+    }
+
+}
+template<size_t blockSize,typename T,typename OP>
+__device__ void BlockReduce(T* sdata,OP op)
+{
+    if(blockSize >= 1024)
+    {
+        if(threadIdx.x<512)
+            sdata[threadIdx.x] = op(sdata[threadIdx.x],sdata[threadIdx.x + 512]);
+        __syncthreads();
+    }
+
+    if(blockSize >= 512)
+    {
+        if(threadIdx.x <256)
+             sdata[threadIdx.x] = op(sdata[threadIdx.x],sdata[threadIdx.x + 256]);
+        __syncthreads();
+    }
+    if(blockSize >= 256)
+    {
+        if(threadIdx.x <128)
+            sdata[threadIdx.x] = op(sdata[threadIdx.x],sdata[threadIdx.x + 128]);
+        __syncthreads();
+    }
+     if(blockSize >= 128)
+    {
+        if(threadIdx.x <64)
+           sdata[threadIdx.x] = op(sdata[threadIdx.x],sdata[threadIdx.x + 64]);
+        __syncthreads();
+    }
+  
+    if(threadIdx.x<32)
+    {
+        volatile T* vshm = sdata;
+        if(blockDim.x > 64)
+            vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+32]);
+        
+        vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+16]);
+        vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+8]);
+        vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+4]);
+        vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+2]);
+        vshm[threadIdx.x] = op(vshm[threadIdx.x],vshm[threadIdx.x+1]);
+    }
+}
+
+
+
+template<size_t BlockSize,typename T,typename OP>
+__global__ void reduce_v6(T* odata, T *indata,int N,OP op)
+{
+    __shared__ T smem[BlockSize];
+
+    size_t tid = threadIdx.x;
+    size_t globalId = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t totalThreads = blockDim.x * gridDim.x;
+
+    T temp = indata[globalId];
+    for(size_t i = globalId+totalThreads;i<N;i+=totalThreads)
+    {
+       temp = op(temp,indata[i]);
+    }
+    smem[tid] = temp;
+    __syncthreads();
+    BlockReduce<BlockSize>(smem,op);
+    
+    if(threadIdx.x == 0)
+        odata[blockIdx.x] = smem[0];
+}
+
+float test_reduce_v6(size_t row =1,size_t col =1)
+{
+    constexpr int blockSize = 256;
+    const int N =2560000;
+    auto array = generateVetcor(N);
+    int gridSize = (N+ blockSize -1)/blockSize;
+
+    float elapsed_time = 0.0f;
+    using VauleType = decltype(array)::value_type;
+    size_t byteSize = array.row() * sizeof(VauleType);
+    size_t girdByteSize = gridSize*sizeof(VauleType);
+    
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+    VauleType* dev_result;
+    VauleType* gpu_result = new VauleType{0};
+    VauleType  cpu_result = 0;
+     
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),girdByteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_result),sizeof(VauleType)));
+    CUDACHECK(cudaMemcpy(dev_idata,array.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock(blockSize);
+    dim3 blocksPerGrid(gridSize); 
+    CudaTimer timer("kernel");
+    timer.startTiming();
+    reduce_v6<blockSize><<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,N,Max<VauleType>());
+    reduce_v6<blockSize><<<1,threadsPerBlock>>>(dev_result,dev_odata,gridSize,Max<VauleType>());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+
+
+    CUDACHECK(cudaMemcpy(gpu_result,dev_result,sizeof(VauleType),cudaMemcpyDeviceToHost));
+
+    reduce_cpu(&cpu_result,array.data_ptr(),N,Max<VauleType>());
+
+    if(cpu_result != *gpu_result)
+    {
+        std::cout<<"the gpu result mismatched cpu's"<<std::endl;
+
+    }
+    delete gpu_result;
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    CUDACHECK(cudaFree(dev_result));
+
+    return elapsed_time;
+}
 
 
 #define LOOP_TEST(test_func,n,row,col,baseline_time) \
@@ -466,28 +673,9 @@ __global__ void reduce_3(T* odata, T* idata,size_t N, OP op)
 
 void loop_test()
 {
-    const int N=2;
-    //dummy test for warm up
-    test_transpose_base();
-    //std::vector<int> test_sizes = {32,64,128,256,512,1024,2048,4096,8192};
-    std::vector<int> test_sizes{2048};
-    std::cout<<"Loop test "<<N<<" times"<<std::endl;
-
-    for(auto size : test_sizes)
-    {
-        std::cout<<"Matrix size: "<<size<<"x"<<size<<std::endl;
-        size_t row = size;
-        size_t col = size;
-        float baseline = BASELINE_TEST(test_transpose_base,N,row,col);
-        LOOP_TEST(test_copyMatrix, N,row,col,baseline);
-        LOOP_TEST(test_cublasTransposeMatrix, N,row,col,baseline);
-        LOOP_TEST(test_transpose_shared, N,row,col,baseline);
-        //LOOP_TEST(test_transpose_stride, N,row,col,baseline);
-        LOOP_TEST(test_transpose_shared_2, N,row,col,baseline);
-        LOOP_TEST(test_transposeMatrix_shared_unroll, N, row, col, baseline);
-        std::cout<<std::endl;
-    }
-
+    const int N=100;
+    test_reduce_v6();
+    LOOP_TEST(test_reduce_v6,N,1,1,0);
     
 }
 
