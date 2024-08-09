@@ -493,31 +493,32 @@ __device__ void wrapReduce(volatile T* data, size_t tid,OP op)
 
 
 
-template<typename T, size_t blockSize, typename OP>
+
+// shared memory reduce + wrap reduce+ unroll*2
+template<size_t blockSize,typename T, typename OP>
 __global__ void reduce_v4(T* odata, T* indata,size_t N, OP op)
 {
     __shared__ T smem[blockSize];
-
     size_t tid = threadIdx.x;
     size_t global_index = blockIdx.x *(blockSize *2) + threadIdx.x;
     if(global_index>N) return;
     smem[tid] = indata[global_index];
     if(global_index+blockSize<N)
-        smem[tid]+=indata[global_index+blockSize];
-    __syncthreads();
-
+        smem[tid] = op(smem[tid],indata[global_index+blockSize]);
+   
     for(size_t stride = blockDim.x/2 ; stride>32; stride>>=1)
     {
+        __syncthreads();
         if(tid<stride)
         {
-            smem[tid]+=smem[tid+stride];
+            smem[tid] = op( smem[tid],smem[tid+stride]);
         }
-        __syncthreads();
+      
     }
 
     if(tid<32)
     {
-        wrapReduce(smem,tid);
+        wrapReduce(smem,tid,op);
     }
 
     if(tid ==0)
@@ -570,16 +571,37 @@ __device__ void BlockReduce(T* sdata,OP op)
 }
 
 
+template<size_t blockSize,typename T,typename OP>
+__global__ void reduce_v5(T* odata, T *indata,int N,OP op)
+{
+   __shared__ T smem[blockSize];
+    size_t tid = threadIdx.x;
+    size_t global_index = blockIdx.x *(blockSize *2) + threadIdx.x;
+    if(global_index>N) return;
+    smem[tid] = indata[global_index];
+    if(global_index+blockSize<N)
+        smem[tid] = op(smem[tid],indata[global_index+blockSize]);
+   
+    __syncthreads();
+    BlockReduce<blockSize>(smem,op);
+    
+    if(threadIdx.x == 0)
+        odata[blockIdx.x] = smem[0];
+}
 
-template<size_t BlockSize,typename T,typename OP>
+
+//shared memory reduce + wrap reduce + block reduce
+template<size_t blockSize,typename T,typename OP>
 __global__ void reduce_v6(T* odata, T *indata,int N,OP op)
 {
-    __shared__ T smem[BlockSize];
+    __shared__ T smem[blockSize];
 
     size_t tid = threadIdx.x;
     size_t globalId = blockIdx.x * blockDim.x + threadIdx.x;
     size_t totalThreads = blockDim.x * gridDim.x;
 
+
+    // process multiple elements per thread,the stride is totalThreads
     T temp = indata[globalId];
     for(size_t i = globalId+totalThreads;i<N;i+=totalThreads)
     {
@@ -587,16 +609,172 @@ __global__ void reduce_v6(T* odata, T *indata,int N,OP op)
     }
     smem[tid] = temp;
     __syncthreads();
-    BlockReduce<BlockSize>(smem,op);
+    BlockReduce<blockSize>(smem,op);
     
     if(threadIdx.x == 0)
         odata[blockIdx.x] = smem[0];
 }
 
+template<size_t sizeBlock,typename T,typename OP>
+__device__ T warpShulffle(T data,OP op)
+{
+    for(int offset = sizeBlock/2;offset>0;offset>>=1)
+    {
+        T temp = __shfl_down_sync(0xFFFFFFFF,data,offset);
+        data = op(data,temp);
+    }
+    return data;
+}
+
+// warp reduce + shared memory reduce 
+template<size_t sizeBlock,typename T,typename OP>
+__global__ void reduce_v7(T* odata, T* idata,int N,OP op)
+{
+    size_t tid = threadIdx.x;
+    size_t globalId = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t totalThreads = blockDim.x * gridDim.x;
+
+    T res = idata[globalId];
+    for(size_t i = globalId+totalThreads;i<N;i+=totalThreads)
+    {
+        res = op(res,idata[i]);
+    }
+    constexpr int Warps = sizeBlock/32;
+    __shared__ float warpSums[Warps];
+    int lane = tid % warpSize;
+    int warpId = tid / warpSize;
+    res = warpShulffle<sizeBlock,T,OP>(res,op);
+    if(lane == 0)
+    {
+        warpSums[warpId] = res;
+    }
+    __syncthreads();
+    //use the first warp to reduce the warp sums
+    //save warp sums in shared memory[0,sizeBlock/warpSize]  to register res.
+    res = (tid < Warps)?warpSums[lane]:0;
+
+    // final reduce within the first warp
+    if(warpId == 0)
+    {
+        res = warpShulffle<Warps,T,OP>(res,op);
+    }
+
+    if(tid == 0)
+    {
+        odata[blockIdx.x] = res;
+    }
+
+}
+
+
+float test_reduce_v4(size_t row =1,size_t col =1)
+{
+    constexpr int blockSize = 256;
+    const int N =25600000;
+    auto array = generateVetcor(N);
+    int gridSize = (N+ blockSize -1)/blockSize;
+
+    float elapsed_time = 0.0f;
+    using VauleType = decltype(array)::value_type;
+    size_t byteSize = array.row() * sizeof(VauleType);
+    size_t girdByteSize = gridSize*sizeof(VauleType);
+    
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+    VauleType* dev_result;
+    VauleType* gpu_result = new VauleType{0};
+    VauleType  cpu_result = 0;
+     
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),girdByteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_result),sizeof(VauleType)));
+    CUDACHECK(cudaMemcpy(dev_idata,array.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock(blockSize);
+    dim3 blocksPerGrid(gridSize/2); // process two elements per thread
+    CudaTimer timer("kernel");
+    timer.startTiming();
+    reduce_v4<blockSize><<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,N,Max<VauleType>());
+    reduce_v4<blockSize><<<1,threadsPerBlock>>>(dev_result,dev_odata,gridSize,Max<VauleType>());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+
+
+    CUDACHECK(cudaMemcpy(gpu_result,dev_result,sizeof(VauleType),cudaMemcpyDeviceToHost));
+
+    reduce_cpu(&cpu_result,array.data_ptr(),N,Max<VauleType>());
+
+    if(cpu_result != *gpu_result)
+    {
+        std::cout<<"the gpu result mismatched cpu's"<<std::endl;
+
+    }
+    delete gpu_result;
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    CUDACHECK(cudaFree(dev_result));
+
+    return elapsed_time;
+}
+
+
+float test_reduce_v5(size_t row =1,size_t col =1)
+{
+    constexpr int blockSize = 256;
+    const int N =25600000;
+    auto array = generateVetcor(N);
+    int gridSize = (N+ blockSize -1)/blockSize;
+
+    float elapsed_time = 0.0f;
+    using VauleType = decltype(array)::value_type;
+    size_t byteSize = array.row() * sizeof(VauleType);
+    size_t girdByteSize = gridSize*sizeof(VauleType);
+    
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+    VauleType* dev_result;
+    VauleType* gpu_result = new VauleType{0};
+    VauleType  cpu_result = 0;
+     
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),girdByteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_result),sizeof(VauleType)));
+    CUDACHECK(cudaMemcpy(dev_idata,array.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock(blockSize);
+    dim3 blocksPerGrid(gridSize/2); 
+    CudaTimer timer("kernel");
+    timer.startTiming();
+    reduce_v5<blockSize><<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,N,Max<VauleType>());
+    reduce_v5<blockSize><<<1,threadsPerBlock>>>(dev_result,dev_odata,gridSize,Max<VauleType>());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+
+
+    CUDACHECK(cudaMemcpy(gpu_result,dev_result,sizeof(VauleType),cudaMemcpyDeviceToHost));
+
+    reduce_cpu(&cpu_result,array.data_ptr(),N,Max<VauleType>());
+
+    if(cpu_result != *gpu_result)
+    {
+        std::cout<<"the gpu result mismatched cpu's"<<std::endl;
+
+    }
+    delete gpu_result;
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    CUDACHECK(cudaFree(dev_result));
+
+    return elapsed_time;
+}
+
+
 float test_reduce_v6(size_t row =1,size_t col =1)
 {
     constexpr int blockSize = 256;
-    const int N =2560000;
+    const int N =25600000;
     auto array = generateVetcor(N);
     int gridSize = (N+ blockSize -1)/blockSize;
 
@@ -645,6 +823,59 @@ float test_reduce_v6(size_t row =1,size_t col =1)
 }
 
 
+float test_reduce_v7(size_t row =1,size_t col =1)
+{
+    constexpr int blockSize = 256;
+    const int N =25600000;
+    auto array = generateVetcor(N);
+    int gridSize = (N+ blockSize -1)/blockSize;
+
+    float elapsed_time = 0.0f;
+    using VauleType = decltype(array)::value_type;
+    size_t byteSize = array.row() * sizeof(VauleType);
+    size_t girdByteSize = gridSize*sizeof(VauleType);
+    
+    VauleType* dev_idata;
+    VauleType* dev_odata;
+    VauleType* dev_result;
+    VauleType* gpu_result = new VauleType{0};
+    VauleType  cpu_result = 0;
+     
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_idata),byteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_odata),girdByteSize));
+    CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&dev_result),sizeof(VauleType)));
+    CUDACHECK(cudaMemcpy(dev_idata,array.data_ptr(),byteSize,cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock(blockSize);
+    dim3 blocksPerGrid(gridSize); 
+    CudaTimer timer("kernel");
+    timer.startTiming();
+    reduce_v7<blockSize><<<blocksPerGrid,threadsPerBlock>>>(dev_odata,dev_idata,N,Max<VauleType>());
+    reduce_v7<blockSize><<<1,threadsPerBlock>>>(dev_result,dev_odata,gridSize,Max<VauleType>());
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaDeviceSynchronize());
+    elapsed_time = timer.stopTiming();
+
+
+    CUDACHECK(cudaMemcpy(gpu_result,dev_result,sizeof(VauleType),cudaMemcpyDeviceToHost));
+
+    reduce_cpu(&cpu_result,array.data_ptr(),N,Max<VauleType>());
+
+    if(cpu_result != *gpu_result)
+    {
+        std::cout<<"the gpu result mismatched cpu's"<<std::endl;
+
+    }
+    delete gpu_result;
+    CUDACHECK(cudaFree(dev_idata));
+    CUDACHECK(cudaFree(dev_odata));
+    CUDACHECK(cudaFree(dev_result));
+
+    return elapsed_time;
+}
+
+
+
 #define LOOP_TEST(test_func,n,row,col,baseline_time) \
 {\
     float elapsed_time = 0.0f;\
@@ -673,10 +904,13 @@ float test_reduce_v6(size_t row =1,size_t col =1)
 
 void loop_test()
 {
-    const int N=100;
+    const int N=2;
     test_reduce_v6();
+    LOOP_TEST(test_reduce_v4, N, 1, 1, 0);
+    LOOP_TEST(test_reduce_v5, N, 1, 1, 0);
     LOOP_TEST(test_reduce_v6,N,1,1,0);
-    
+    LOOP_TEST(test_reduce_v7,N,1,1,0);
+
 }
 
 
