@@ -352,6 +352,123 @@ __global__ void histogram(const T* data, size_t N, int* hist, int num_bins) {
   }
 }
 
+
+template<typename T,size_t num_bins>
+__global__ void histogram_v1(const T* data, size_t N, int* hist) {
+  __shared__ int hist_s[num_bins];
+  for(int i= threadIdx.x;i<num_bins;i+= blockDim.x)
+  {
+      hist_s[i] = 0;
+  }
+  __syncthreads();
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid < N) {
+    int bin = data[tid] % num_bins;
+    atomicAdd(&hist_s[bin], 1);
+  }
+  __syncthreads();
+  for(int i = threadIdx.x;i<num_bins;i+=blockDim.x)
+  {
+     int res=hist_s[i];
+     if(res>0)
+        atomicAdd(&hist[i],res);
+  }
+  
+}
+
+/*
+histogram_v2 通过让每个线程处理多个数据元素（由 Factor 决定），提高了每个线程的工作效率。
+即使某些线程在处理完一个数据后没有剩余工作，它们仍然可以继续处理分配给它们的其他数据。
+这减少了线程空闲的可能性，从而提高了整体的计算效率。
+
+*/
+template<typename T,size_t num_bins,size_t Factor>
+__global__ void histogram_v2(const T* data, size_t N, int* hist) {
+  __shared__ int hist_s[num_bins];
+  for(int i= threadIdx.x;i<num_bins;i+= blockDim.x)
+  {
+      hist_s[i] = 0;
+  }
+  __syncthreads();
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int minLen = min((tid+1)*Factor,N);
+  for(int i= tid*Factor;i<minLen;++i)
+  {
+    int bin = data[i] % num_bins;
+    atomicAdd(&hist_s[bin], 1);
+  }
+  __syncthreads();
+  for(int i = threadIdx.x;i<num_bins;i+=blockDim.x)
+  {
+     int res=hist_s[i];
+     if(res>0)
+        atomicAdd(&hist[i],res);
+  }
+  
+}
+
+template<typename T,size_t num_bins>
+__global__ void histogram_v3(const T* data, size_t N, int* hist) {
+  __shared__ int hist_s[num_bins];
+  for(int i= threadIdx.x;i<num_bins;i+= blockDim.x)
+  {
+      hist_s[i] = 0;
+  }
+  __syncthreads();
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  for(int i = tid;i<N;i+= blockDim.x*gridDim.x)
+  {
+    int bin = data[i] % num_bins;
+    atomicAdd(&hist_s[bin], 1);
+  }
+  __syncthreads();
+  for(int i = threadIdx.x;i<num_bins;i+=blockDim.x)
+  {
+     int res=hist_s[i];
+     if(res>0)
+        atomicAdd(&hist[i],res);
+  }
+  
+}
+template<typename T,size_t num_bins>
+__global__ void histogram_v4(const T* data, size_t N, int* hist) {
+  __shared__ int hist_s[num_bins];
+  for(int i= threadIdx.x;i<num_bins;i+= blockDim.x)
+  {
+      hist_s[i] = 0;
+  }
+  __syncthreads();
+  unsigned int  accumulator =0;
+  int preBinIndex = -1;
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  for(int i = tid;i<N;i+= blockDim.x*gridDim.x)
+  {
+    int bin = data[i] % num_bins;
+    if(bin == preBinIndex)
+        ++accumulator;
+    else{
+        if(accumulator>0)
+        {
+            atomicAdd(&hist_s[preBinIndex], accumulator);
+        }
+        accumulator = 1;
+        preBinIndex = bin;
+    }
+  }
+  if(accumulator>0)
+  {
+    atomicAdd(&hist_s[preBinIndex], accumulator);
+  }
+  __syncthreads();
+  for(int i = threadIdx.x;i<num_bins;i+=blockDim.x)
+  {
+     int res=hist_s[i];
+     if(res>0)
+        atomicAdd(&hist[i],res);
+  }
+  
+}
+
 float test_histogram() {
 
   const int N = 1000000;  
@@ -389,10 +506,169 @@ float test_histogram() {
   delete[] hist;
   return elapsed_time;
 }
+
+float test_histogram_v1() {
+
+  const int N = 1000000;  
+  const int num_bins = 256;
+  Matrix<int> data = generateVetcor(N);
+  int* d_data;
+  int* d_hist;
+  int* hist = new int[num_bins];
+  memset(hist, 0, num_bins * sizeof(int));
+  CUDACHECK(cudaMalloc(&d_data, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_hist, num_bins * sizeof(int)));
+  CUDACHECK(cudaMemcpy(d_data, data.data_ptr(), N * sizeof(int), cudaMemcpyHostToDevice));
+  cudaMemset(d_hist, 0, num_bins * sizeof(int));
+  CudaTimer timer;
+  timer.startTiming();
+  histogram_v1<int,256><<<(N + 255) / 256, 256>>>(d_data, N, d_hist);
+  CUDACHECK(cudaDeviceSynchronize());
+  float elapsed_time = timer.stopTiming();
+  CUDACHECK(cudaMemcpy(hist, d_hist, num_bins * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(d_data));
+  CUDACHECK(cudaFree(d_hist));
+
+  int* hist_cpu = new int[num_bins];
+  memset(hist_cpu, 0, num_bins * sizeof(int));
+  histogram_cpu(data.data_ptr(),N, hist_cpu,  num_bins);
+
+  for (int i = 0; i < num_bins; ++i) {
+    if (hist[i] != hist_cpu[i]) {
+      std::cerr << "Mismatch at bin " << i << " expected " << hist_cpu[i]
+                << " got " << hist[i] << std::endl;
+      break;
+    }
+  }
+
+  delete[] hist;
+  return elapsed_time;
+}
+
+float test_histogram_v2() {
+
+  const int N = 1000000;  
+  const int num_bins = 256;
+  Matrix<int> data = generateVetcor(N);
+  int* d_data;
+  int* d_hist;
+  int* hist = new int[num_bins];
+  memset(hist, 0, num_bins * sizeof(int));
+  CUDACHECK(cudaMalloc(&d_data, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_hist, num_bins * sizeof(int)));
+  CUDACHECK(cudaMemcpy(d_data, data.data_ptr(), N * sizeof(int), cudaMemcpyHostToDevice));
+  cudaMemset(d_hist, 0, num_bins * sizeof(int));
+  CudaTimer timer;
+  timer.startTiming();
+  histogram_v2<int,256,8><<<(N + 255) / 256, 256>>>(d_data, N, d_hist);
+  CUDACHECK(cudaDeviceSynchronize());
+  float elapsed_time = timer.stopTiming();
+  CUDACHECK(cudaMemcpy(hist, d_hist, num_bins * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(d_data));
+  CUDACHECK(cudaFree(d_hist));
+
+  int* hist_cpu = new int[num_bins];
+  memset(hist_cpu, 0, num_bins * sizeof(int));
+  histogram_cpu(data.data_ptr(),N, hist_cpu,  num_bins);
+
+  for (int i = 0; i < num_bins; ++i) {
+    if (hist[i] != hist_cpu[i]) {
+      std::cerr << "Mismatch at bin " << i << " expected " << hist_cpu[i]
+                << " got " << hist[i] << std::endl;
+      break;
+    }
+  }
+
+  delete[] hist;
+  return elapsed_time;
+}
+
+float test_histogram_v3() {
+
+  const int N = 1000000;  
+  const int num_bins = 256;
+  //const int gridSize = 100;
+  Matrix<int> data = generateVetcor(N);
+  int* d_data;
+  int* d_hist;
+  int* hist = new int[num_bins];
+  memset(hist, 0, num_bins * sizeof(int));
+  CUDACHECK(cudaMalloc(&d_data, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_hist, num_bins * sizeof(int)));
+  CUDACHECK(cudaMemcpy(d_data, data.data_ptr(), N * sizeof(int), cudaMemcpyHostToDevice));
+  cudaMemset(d_hist, 0, num_bins * sizeof(int));
+  CudaTimer timer;
+  timer.startTiming();
+  histogram_v3<int,256><<<400, 256>>>(d_data, N, d_hist);
+  CUDACHECK(cudaDeviceSynchronize());
+  float elapsed_time = timer.stopTiming();
+  CUDACHECK(cudaMemcpy(hist, d_hist, num_bins * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(d_data));
+  CUDACHECK(cudaFree(d_hist));
+
+  int* hist_cpu = new int[num_bins];
+  memset(hist_cpu, 0, num_bins * sizeof(int));
+  histogram_cpu(data.data_ptr(),N, hist_cpu,  num_bins);
+
+  for (int i = 0; i < num_bins; ++i) {
+    if (hist[i] != hist_cpu[i]) {
+      std::cerr << "Mismatch at bin " << i << " expected " << hist_cpu[i]
+                << " got " << hist[i] << std::endl;
+      break;
+    }
+  }
+
+  delete[] hist;
+  return elapsed_time;
+}
+float test_histogram_v4() {
+
+  const int N = 1000000;  
+  const int num_bins = 256;
+  //const int gridSize = 100;
+  Matrix<int> data = generateVetcor(N);
+  int* d_data;
+  int* d_hist;
+  int* hist = new int[num_bins];
+  memset(hist, 0, num_bins * sizeof(int));
+  CUDACHECK(cudaMalloc(&d_data, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_hist, num_bins * sizeof(int)));
+  CUDACHECK(cudaMemcpy(d_data, data.data_ptr(), N * sizeof(int), cudaMemcpyHostToDevice));
+  cudaMemset(d_hist, 0, num_bins * sizeof(int));
+  CudaTimer timer;
+  timer.startTiming();
+  histogram_v4<int,256><<<400, 256>>>(d_data, N, d_hist);
+  CUDACHECK(cudaDeviceSynchronize());
+  float elapsed_time = timer.stopTiming();
+  CUDACHECK(cudaMemcpy(hist, d_hist, num_bins * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(d_data));
+  CUDACHECK(cudaFree(d_hist));
+
+  int* hist_cpu = new int[num_bins];
+  memset(hist_cpu, 0, num_bins * sizeof(int));
+  histogram_cpu(data.data_ptr(),N, hist_cpu,  num_bins);
+
+  for (int i = 0; i < num_bins; ++i) {
+    if (hist[i] != hist_cpu[i]) {
+      std::cerr << "Mismatch at bin " << i << " expected " << hist_cpu[i]
+                << " got " << hist[i] << std::endl;
+      break;
+    }
+  }
+
+  delete[] hist;
+  return elapsed_time;
+}
+
+
 void loop_test()
 {
     const int n = 10;
     LOOP_TEST(test_histogram,n,1);
+    LOOP_TEST(test_histogram_v1,n,1);
+    LOOP_TEST(test_histogram_v2,n,1);
+    LOOP_TEST(test_histogram_v3,n,1);
+    LOOP_TEST(test_histogram_v4,n,1);
 }
 
 
