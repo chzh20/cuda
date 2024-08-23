@@ -140,6 +140,34 @@ __global__ void filter_v1(T* dest, T *src,T*counter,int N)
 }
 
 
+template <typename T,size_t blocksize>
+__global__ void filter_v2(T* dest, T *src,T*counter,int N)
+{
+    __shared__ int s_counter;
+    __shared__ int s_dest[blocksize];
+    s_counter = 0;
+    for(int i=0;i<blocksize;++i)
+    {
+        s_dest[i] = 0;
+    }
+    __syncthreads();
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if(tid < N ){
+        int val = src[tid];
+        if(val > 0){
+            s_dest[atomicAdd(&s_counter,1)] = val;
+        }
+    }
+    __syncthreads();
+    int offset = atomicAdd(counter,s_counter);
+    for(int i=0;i<s_counter;++i)
+    {
+        dest[offset+i] = s_dest[i];
+    }
+}
+
+
+
 
 float test_filter_v1() {
 
@@ -184,8 +212,58 @@ float test_filter_v1() {
                 << " got " << result[i] << std::endl;
     }
 
-    return elapsed_time;
+
   }
+  return elapsed_time;
+}
+
+
+float test_filter_v2() {
+
+  const int N = 1000000;  
+  std::vector<int> data = generatevector(N);
+  int  counter = 0;
+  int* d_data;
+  int* d_dest;
+  int* d_counter;
+  CUDACHECK(cudaMalloc(&d_data, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_dest, N * sizeof(int)));
+  CUDACHECK(cudaMalloc(&d_counter,   sizeof(int)));
+  CUDACHECK(cudaMemcpy(d_data, data.data(), N * sizeof(int), cudaMemcpyHostToDevice));
+  CUDACHECK(cudaMemcpy(d_counter, &counter,  sizeof(int), cudaMemcpyHostToDevice));
+  cudaMemset(d_dest, 0, N * sizeof(int));
+  CudaTimer timer;
+  timer.startTiming();
+  filter_v2<int,256><<<(N + 255) / 256, 256>>>(d_dest, d_data, d_counter, N);
+  CUDACHECK(cudaDeviceSynchronize());
+  float elapsed_time = timer.stopTiming();
+  CUDACHECK(cudaMemcpy(&counter, d_counter, sizeof(int), cudaMemcpyDeviceToHost));
+  std::vector<int> result(counter,0);
+
+  CUDACHECK(cudaMemcpy(result.data(), d_dest, counter * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(d_data));
+  CUDACHECK(cudaFree(d_dest));
+  CUDACHECK(cudaFree(d_counter));
+
+  std::vector<int> result_cpu(N,0);
+  int counter_cpu = filter(result_cpu.data(),data.data(),N);
+  if(counter != counter_cpu){
+        std::cerr<<"Mismatch at counter "<<counter<<" expected "<<counter_cpu<<std::endl;
+        return  elapsed_time;
+  }
+
+  std::sort(result.begin(), result.end());
+  std::sort(result_cpu.begin(), result_cpu.begin() + counter_cpu);
+  for (int i = 0; i < counter_cpu; i++) {
+    if (result[i] != result_cpu[i]) {
+      std::cerr << "Mismatch at " << i << " expected " << result_cpu[i]
+                << " got " << result[i] << std::endl;
+    }
+
+    
+  }
+
+  return elapsed_time;
 }
 
 
@@ -193,12 +271,13 @@ void loop_test()
 {
     const int n = 10;
     LOOP_TEST(test_filter_v1,n,1);
+    LOOP_TEST(test_filter_v2,n,1);
 }
 
 
 int main()
 {
-    printGPUInfo();
+    //printGPUInfo();
     loop_test();
     return 0;
 }
