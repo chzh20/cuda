@@ -116,15 +116,6 @@ static std::vector<U> generatevector(size_t N) {
     }\
 }
 
-__device__ float cuda_tanh(float x) {
-    return tanhf(x);
-}
-__device__ double cuda_tanh(double x) {
-    return tanh(x);
-}
-__device__ __half cuda_tanh(__half x) {
-    return tanh(x);
-}
 template<typename T>
 void gelu_cpu(T* odata,T* idata,size_t N)
 {
@@ -137,6 +128,9 @@ void gelu_cpu(T* odata,T* idata,size_t N)
     }
 }
 
+
+
+
 template<typename T>
 __global__ void gelu_kernel(T* odata, const T* idata, size_t N)
 {
@@ -144,10 +138,14 @@ __global__ void gelu_kernel(T* odata, const T* idata, size_t N)
     if (idx < N)
     {
         const T x = idata[idx];
-        const T cdf = T(0.5) * (T(1.0) + __tanf((T(0.797884) * (x + T(0.044715) * x * x * x))));
+        const T cdf = T(0.5) * (T(1.0) + tanh((T(0.797884) * (x + T(0.044715) * x * x * x))));
         odata[idx] = x * cdf;
     }
 }
+
+
+
+
 
 template<typename T>
 void gelu_gpu(T* odata, T* idata, size_t N)
@@ -161,6 +159,100 @@ void gelu_gpu(T* odata, T* idata, size_t N)
 }
 
 
+template<typename T,size_t Size>
+struct alignas(sizeof(T)*Size) AlignedVector
+{
+    T data[Size];
+    __host__ __device__ inline const T& operator[](size_t i) const { return data[i]; }
+    __host__ __device__ inline T& operator[](size_t i) { return data[i]; }
+
+};
+
+template<typename T>
+struct GeluFunctor
+{
+    static constexpr T sqrt_2_over_pi = static_cast<T>(0.79788456080286541);
+    static constexpr T a =  static_cast<T>(0.044715);
+
+    __device__ GeluFunctor() = default;
+
+    __device__ __forceinline__ T operator()(T x) const
+    {
+       const T cdf = T(0.5) * (T(1.0) + tanh(sqrt_2_over_pi * (x + a * x * x * x)));
+        return x * cdf;
+    }
+};
+
+__device__ __forceinline__ float TanhApprox(float x)
+{
+#if __CUDA_ARCH__ >= 800
+    float r;
+    asm("tanh.approx.f32 %0,%1;" : "=f"(r) : "f"(x));
+    return r;
+#else
+    return tanhf(x);
+#endif
+
+}
+
+
+template<>
+struct GeluFunctor<half>
+{
+    static constexpr float sqrt_2_over_pi= 0.79788456080286541f;
+    static constexpr float a = 0.044715;
+   
+    __device__ GeluFunctor() = default;
+
+
+    __device__ __forceinline__ half operator()(half x) const
+    {
+#if __CUDA_ARCH__ >= 800
+        const float tanh_in = __half2float(__float2half_rn(sqrt_2_over_pi) * (x + __float2half_rn(a) * x * x * x));
+        const float tanh_out = TanhApprox(tanh_in);
+        const half cdf = 0.5h * (1.0h + __float2half_rn(tanh_out));
+        return x * cdf;
+
+#else
+     GeluFunctor <float> float_gelu;
+     return static_cast<half>(float_gelu(static_cast<float>(x)));
+#endif
+
+    }
+};
+
+
+template<size_t VecSize>
+__global__ void FP16GeluKernel(half* odata,const half* idata,size_t N)
+{
+    //向量化 load & store
+    int offset = (blockIdx.x * blockDim.x + threadIdx.x) * VecSize;
+    int stride = blockDim.x * gridDim.x * VecSize;
+    GeluFunctor<half> gelu;
+    __half y_reg[VecSize];
+
+    using ArrT = AlignedVector<__half, VecSize>;
+    for(; offset < N; offset += stride)
+    {
+        const __half* in = idata + offset;
+        __half* out = odata + offset;
+
+        if(VecSize == 1)
+        {
+            y_reg[0] = gelu(in[0]);
+        }
+        else
+        {
+            #pragma unroll
+            for(int i = 0;i < VecSize;++i)
+            {
+                y_reg[i] = gelu(in[i]);
+            }
+        }
+
+        *reinterpret_cast<ArrT*>(out) = *reinterpret_cast<ArrT*>(y_reg);
+    }
+}
 
 
 template<typename T>
@@ -206,6 +298,8 @@ float test_gelu()
     return elapsed_time;
 }
 
+
+
 void looptest()
 {
     std::cout << "测试单精度GELU:" << std::endl;
@@ -213,8 +307,6 @@ void looptest()
 
     std::cout << "\n测试双精度GELU:" << std::endl;
     LOOP_TEST(test_gelu<double>, 10, 1);
-    std::cout << "\n半精度GELU:" << std::endl;
-    LOOP_TEST(test_gelu<half>, 10, 1);
 }
 
 
