@@ -1,6 +1,5 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
-#include <__clang_cuda_builtin_vars.h>
 #include <climits>
 #include <cstddef>
 #include<iostream>
@@ -125,16 +124,16 @@ __global__ void gemvKernel(float* mat,float* vec,float* dst,int m,int n)
     int tid = threadIdx.x;
     int bid = blockIdx.x; // row index
     float thread_local_sum = 0.0f;
-    for(int i =0; i< VECS_PER_THREAD;++i)
+    for(int i = 0; i < VECS_PER_THREAD;++i)
     {
         float4 * mat4 = reinterpret_cast<float4*>(&mat[bid*n+ tid*VEC_SIZE]);
         float4 * vec4 = reinterpret_cast<float4*>(&vec[tid*VEC_SIZE]);
-        thread_local_sum += mat4[i].x*vec4[i].x+mat4[i].y*vec4[i].y+mat4[i].z*vec4[i].z+mat4[i].w*vec4[i].w;
+        thread_local_sum = mat4[i].x*vec4[i].x+mat4[i].y*vec4[i].y+mat4[i].z*vec4[i].z+mat4[i].w*vec4[i].w;
     }
     float block_sum = blockReduce<SumOp,float>(thread_local_sum);
     if(tid == 0)
     {
-        dst[bid] = block_sum;
+        dst[blockIdx.x] = block_sum;
     }
     __syncthreads();
 
@@ -183,16 +182,16 @@ template<size_t VECS_PER_THREAD, size_t VEC_SIZE,size_t THREAD_NUMS>
 struct DispatchLauncher
 {
     template<typename T>
-    static void launch(const T* mat,const T* vec,T* dst,int m,int n)
+    static void launch( T* mat, T* vec,T* dst,int m,int n)
     {
         dim3 grid(m);
-        dim3 block(THREAD_NUMS);
+        dim3 block(`);
         float time=0.0f;
         cudaEvent_t start,stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
         cudaEventRecord(start,0);
-        gemvKernel<T><<<grid,block>>>(mat,vec,dst,m,n);
+        gemvKernel<VECS_PER_THREAD,VEC_SIZE><<<grid,block>>>(mat,vec,dst,m,n);
         CUDACHECK(cudaGetLastError());
         cudaEventRecord(stop,0);
         cudaEventSynchronize(stop);
@@ -262,5 +261,12 @@ void gemv_kernel(T* mat,T*d_mat,T*vec,T*d_vec,T*dst,T*d_dst)
 }
 int main()
 {
+    float *mat;
+    float *vec;
+    float *d_mat;
+    float *d_vec;
+    float *d_dst;
+    float *dst;
+    gemv_kernel(mat,d_mat,vec,d_vec,dst,d_dst);
     return 0;
 }
