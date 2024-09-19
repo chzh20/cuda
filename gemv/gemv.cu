@@ -1,5 +1,6 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
+#include <__clang_cuda_builtin_vars.h>
 #include <climits>
 #include <cstddef>
 #include<iostream>
@@ -78,6 +79,25 @@ __device__ __forceinline__ T warpReduce(T val)
     return val;
 }
 
+template<template<typename> typename ReductionOp,typename T>
+__device__ __forceinline__ T blockReduce(T val)
+{
+    static __shared__ T shared[64]; //warpsize 2048/32 = 64
+    int tid = threadIdx.x;
+    int lane = threadIdx.x%warpSize;
+    int wid = threadIdx.x/warpSize;
+    int  warp_nums = (blockDim.x+warpSize-1)/warpSize;
+    val = warpReduce<ReductionOp,T>(val);
+    if(lane == 0)
+    {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    T wrap_val = (tid<warp_nums)?shared[tid]:T(0);
+    return  warpReduce<ReductionOp,T>(wrap_val);
+}
+
+
 template<typename T>
 struct SumOp
 {
@@ -86,6 +106,16 @@ struct SumOp
         return a+b;
     }
 };
+template<>
+struct SumOp<half>
+{
+    __device__ __forceinline__ half operator()(const half &a,const half &b)
+    {
+        return __hadd(a,b);
+    }
+};
+
+
 
 //compute one element per block
 //m blocks
@@ -101,20 +131,47 @@ __global__ void gemvKernel(float* mat,float* vec,float* dst,int m,int n)
         float4 * vec4 = reinterpret_cast<float4*>(&vec[tid*VEC_SIZE]);
         thread_local_sum += mat4[i].x*vec4[i].x+mat4[i].y*vec4[i].y+mat4[i].z*vec4[i].z+mat4[i].w*vec4[i].w;
     }
-    float block_sum = warpReduce<SumOp,float>(thread_local_sum);
+    float block_sum = blockReduce<SumOp,float>(thread_local_sum);
     if(tid == 0)
     {
         dst[bid] = block_sum;
     }
-
-
+    __syncthreads();
 
 }
 
-template<typename VECS_PER_THREAD,size_t VEC_SIZE>
-__global__ void gemvKernel(const half2* mat,const half2* vec,half2* dst,int m,int n)
+template<size_t VECS_PER_THREAD,size_t VEC_SIZE>
+__global__ void gemvKernel(half* mat,half* vec,half* dst,int m,int n)
 {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    half thread_local_sum = 0.0f;
+    for(int i = 0; i< VECS_PER_THREAD; ++i)
+    {
+       float4 * mat4 = reinterpret_cast<float4*>(&mat[bid*n+tid*VEC_SIZE]);
+       float4 * vec4 = reinterpret_cast<float4*>(&vec[tid*VEC_SIZE]);
+       half2*   vec_h1 =(half2*)&vec4[i].x;
+       half2*   vec_h2 =(half2*)&vec4[i].y;
+       half2*   vec_h3 = (half2*)&vec4[i].z;
+       half2*   vec_h4 = (half2*)&vec4[i].w;
 
+       half2*   mat_h1 = (half2*)&mat4[i].x;
+       half2*   mat_h2 = (half2*)&mat4[i].y;
+       half2*   mat_h3 = (half2*)&mat4[i].z;
+       half2*   mat_h4 = (half2*)&mat4[i].w;
+       half2 res1 = __hmul2(*mat_h1,*vec_h1);
+       half2 res2 = __hmul2(*mat_h2,*vec_h2);
+       half2 res3 =__hmul2(*mat_h3,*vec_h3);
+       half2 res4 = __hmul2(*mat_h4,*vec_h4);
+       half2 res = __hadd2(__hadd2(res1, res2), __hadd2(res3, res4));
+       thread_local_sum = __hadd(res.x,res.y);
+    }
+    half block_sum = blockReduce<SumOp,half>(thread_local_sum);
+    if(tid ==0)
+    {
+        dst[bid] = block_sum;
+    }
+    __syncthreads();
 }
 
 
@@ -193,5 +250,17 @@ void gemv_kernel(T* mat,T*d_mat,T*vec,T*d_vec,T*dst,T*d_dst)
     {
         std::cout<<"Success"<<std::endl;
     }
+    free(vec);
+    free(mat);
+    free(dst);
+    free(dst_cpu);
+    cudaFree(d_mat);
+    cudaFree(d_vec);
+    cudaFree(d_dst);
 
+
+}
+int main()
+{
+    return 0;
 }
