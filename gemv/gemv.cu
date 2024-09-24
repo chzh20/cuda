@@ -272,7 +272,7 @@ namespace gemv_2
 template<size_t Cols,typename T>
 struct ThreadsPerMatRow
 {
-    constexpr size_t vaule = Cols*sizeof(T)/16;
+    static constexpr size_t value = Cols*sizeof(T)/16;
 };
 __device__ __forceinline__ float fma(float a, float b, float c)
 {
@@ -302,48 +302,70 @@ __device__ __forceinline__ float4 add(float4 a, float4 b)
     return res;
 }
 
+
+//vec[1,N]*mat[N,M]
+template<typename T>
+void gemvCPUV2(const T *mat, const T *vec, T *res, int n, int m)
+{
+   for(int i= 0; i<m;++i)
+   {
+        res[i] = 0.0f;
+        for(int j = 0;j<n;++j)
+        {
+            res[i] += vec[j]*mat[j+m*i];
+        }
+   }
+}
+
+
+
 // vec[1,N]*mat[N,M]
 template<size_t THREADS_PER_ROW, size_t THREADS_PER_BLCOK,size_t VEC_SIZE>
 __global__ void gemvKernel(float* mat,float*vec,float*dst,int N,int M)
 {
-    int tid = threadId.x;
-    int bid = blockId.x;
-
-
-    // 当前线程所处理数据的位置
+    int tid = threadIdx.x;
+    //int bid = blockIdx.x;
+    // current row in the matrix in the block
     int mat_row = tid / THREADS_PER_ROW;
-    // 每个线程负责数据所在向量号
+    // current  position in the row of the matrix in the block
     int mat_index = (tid % THREADS_PER_ROW) * VEC_SIZE;
-    // one block can deal with
+    // one block sise can deal with rows_per_block rows
     constexpr size_t rows_per_block = THREADS_PER_BLCOK / THREADS_PER_ROW;
 
     float4 out;
-    __shared__ float out_smem[512];
-    for(int row = mat_row; row < N ; row + = rows_per_block)
+    // intra fma reduction
+    for(int row = mat_row; row < N ; row += rows_per_block)
     {
-        float4 mat4 = reinterpret_cast<float*>(mat)[row*M+mat_index];
+        float4 mat4 = *reinterpret_cast<float4*>(&mat[row*M+mat_index]);
         float  v = vec[row];
         out = gemv_2::fma(v,mat4,out);
     }
 
+    // we nonly need half of the block size*M to store the data
+    //constexpr size_t SM_SIZE= M*rows_per_block/2; 
+    __shared__ float out_smem[512];
+    // inter binary reduction
     for(int row = rows_per_block; row>=2; row/=2)
     {
         int mid = row/2;
         if(mat_row >= mid && mat_row < row)
-        {
-            *reinterpret_cast<float4*>(&out_smem[mat_row*M+mat_index])= out;
+        {   
+            // store the result in the first half of the shared memory
+            *reinterpret_cast<float4*>(&out_smem[(mat_row-mid)*M + mat_index])= out;
         }
         __syncthreads();
         if(mat_row < mid)
         {
+            // add the second half of the shared memory to the first half
             out = gemv_2::add(*reinterpret_cast<float4*>(&out_smem[mat_row*M+mat_index]),out);
         }
         __syncthreads();
     }
 
+    // the final result is stored in the first row after binary reduction
     if(mat_row == 0)
     {
-        *reinterpret_cast<float4*>(&res[mat_index])= out;
+        *reinterpret_cast<float4*>(&dst[mat_index])= out;
     }                                                                                                                                               
 
 }
@@ -355,7 +377,7 @@ template<size_t THREADS_PER_ROW, size_t VEC_SIZE,size_t THREADS_PER_BlOCK>
 struct DispatchLauncher
 {
     template<typename T>
-    static void launch( T* mat, T* vec,T* dst,int m,int n)
+    static void launch( T* mat, T* vec,T* dst,int n,int m)
     {
         dim3 grid(1);
         dim3 block(THREADS_PER_BlOCK);
@@ -364,7 +386,7 @@ struct DispatchLauncher
         cudaEventCreate(&start);
         cudaEventCreate(&stop); 
         cudaEventRecord(start,0);
-        gemvKernel<THREADS_PER_ROW,VEC_SIZE><<<grid,block>>>(mat,vec,dst,m,n);
+        gemvKernel<THREADS_PER_ROW,THREADS_PER_BlOCK,VEC_SIZE><<<grid,block>>>(mat,vec,dst,n,m);
         CUDACHECK(cudaGetLastError());
         cudaEventRecord(stop,0);
         cudaEventSynchronize(stop);
@@ -377,19 +399,20 @@ struct DispatchLauncher
 template<typename T>
 void gemv_kernel(T* mat,T*d_mat,T*vec,T*d_vec,T*dst,T*d_dst)
 {
-    constexpr size_t M = 256;
+
     constexpr size_t N = 2048;
+    constexpr size_t M = 256;
     vec = (T*)malloc(N*sizeof(T));
-    mat = (T*)malloc(M*N*sizeof(T));
+    mat = (T*)malloc(N*M*sizeof(T));
     dst = (T*)malloc(M*sizeof(T));
 
-    cudaMalloc(&d_mat,M*N*sizeof(T));
+    cudaMalloc(&d_mat,N*M*sizeof(T));
     cudaMalloc(&d_vec,N*sizeof(T));
     cudaMalloc(&d_dst,M*sizeof(T));
 
     for(int i=0;i < N;++i)
     {
-        vec[i] = 1.0f;
+        vec[i] = 1.5f;
     }
     for(int i= 0;i<M*N;++i)
     {
@@ -402,14 +425,14 @@ void gemv_kernel(T* mat,T*d_mat,T*vec,T*d_vec,T*dst,T*d_dst)
     
     constexpr size_t THREAD_Per_Block = 256;
     constexpr size_t VEC_SIZE = Vec<T>::size;
-    constexpr szie_t THREADS_PER_ROW = gemv_2::ThreadsPerMatRow<M,T>::value;
+    constexpr size_t THREADS_PER_ROW = gemv_2::ThreadsPerMatRow<M,T>::value;
 
-    DispatchLauncher<THREADS_PER_ROW,VEC_SIZE,THREAD_Per_Block>::template launch(d_mat,d_vec,d_dst,M,N);
+    DispatchLauncher<THREADS_PER_ROW,VEC_SIZE,THREAD_Per_Block>::template launch(d_mat,d_vec,d_dst,N,M);
 
     cudaMemcpy(dst,d_dst,M*sizeof(T),cudaMemcpyDeviceToHost);
 
     T* dst_cpu = (T*)malloc(M*sizeof(T));
-    gemvCPU(mat,vec,dst_cpu,M,N);
+    gemvCPUV2(mat,vec,dst_cpu,N,M);
     if(!checkGroundTruth(dst,dst_cpu,M))
     {
         std::cerr<<"Error"<<std::endl;
@@ -443,6 +466,7 @@ int main()
     float *d_vec = nullptr;
     float *d_dst = nullptr;
     float *dst = nullptr;
-    gemv_kernel(mat,d_mat,vec,d_vec,dst,d_dst);
+    //gemv_kernel(mat,d_mat,vec,d_vec,dst,d_dst);
+    gemv_2::gemv_kernel(mat,d_mat,vec,d_vec,dst,d_dst);
     return 0;
 }
