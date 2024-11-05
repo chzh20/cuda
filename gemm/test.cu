@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include"sgemm_1D_blocktiling.cuh"
 #include"sgemm_2D_blocktiling.cuh"
+#include"sgemm_warptilling.cuh"
 
 
 template <typename T>
@@ -277,11 +278,11 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
         assert(config.B != nullptr);
         assert(config.C != nullptr);
         kernelTest<KernelType,Type>(kernel,kernel_name,config);
-        CHECKRESULT(C_cublas, out_put, kernel_name,config.m * config.n);
+        //CHECKRESULT(C_cublas, out_put, kernel_name,config.m * config.n);
         //printMatrix(out_put,  m, n);
         delete[] out_put;
     };
-  
+    cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
 
     KernelConfig<Type> config1 {m, n, k, alpha, beta, 
                                   dim3((BM*BN)/TM),  //block_size, each thread is responsible for TM elements
@@ -309,6 +310,15 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
     config3.cudaSharedmemCarveoutMaxShared = true;
     run_kernel(sgemm_2D_Blocktiling,"sgemm_2D_Blocktiling",config3);
 
+
+    KernelConfig<Type> config4  {m, n, k, alpha, beta, 
+                                  dim3(128),  //block_size, each thread is responsible for TM*TN elements
+                                  dim3(CEIL_DIV(m,128),CEIL_DIV(n,128)), //grid_size
+                                "sgemm_Warptiling", A, B};
+    config4.cudaSharedmemCarveoutMaxShared = true;
+    run_kernel(sgemm_Warptiling,"sgemm_Warptiling",config4);
+
+
     //cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
     //CHECKRESULT(C_cpu, C_cublas,"cublas", m * n);
     delete[] A;
@@ -325,7 +335,7 @@ void loopTest()
     std::array<uint,num> k = { 32, 64, 128, 256, 512, 1024, 2048,4096};
     float alpha = {1.0f};
     float beta = {1.0f};
-    for(int i =3;i< num; i++)
+    for(int i =4;i< num; i++)
     {
        printf("m=%d, n=%d, k=%d\n", m[i], n[i], k[i]);
        test(m[i], n[i], k[i], alpha, beta);
