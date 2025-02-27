@@ -4,7 +4,9 @@
 #include <vector>
 #include <chrono>
 #include <random>
-
+#include<execution>
+#include <algorithm>
+#include<numeric>
 
 /*
 
@@ -15,7 +17,7 @@ reduce_basic 存在以下问题：
 */
 
 template<typename T, typename OP>
-__global__ void reduce_basic(const T * input,T* output, int n, OP op)
+__global__ void reduce_basic(T * input,T* output, int n, OP op)
 {
     int tid = threadIdx.x;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -67,7 +69,7 @@ reduce1的最大问题是bank冲突。我们把目光聚焦在这个for循环中
 */
 
 template<typename T, int BlockSize, typename OP>
-__global__ void reduce_v1(const T * input,T* output, int n, OP op)
+__global__ void reduce_v1(T * input,T* output, int n, OP op)
 {
     int tid = threadIdx.x;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -85,7 +87,7 @@ __global__ void reduce_v1(const T * input,T* output, int n, OP op)
         int index = 2 * stride * tid;
         if(index < blockDim.x ) // 有一半的线程没有工作
         {
-            smem[index] = op(smem[index], smem[index + stride]);
+            smem[tid] = op(smem[index], smem[index + stride]);
         }
         __syncthreads();
     }
@@ -113,7 +115,7 @@ reduce_v2 有以下优点：
 */
 
 template<typename T, int BlockSize, typename OP>
-__global__ void reduce_v2(const T * input,T* output, int n, OP op)
+__global__ void reduce_v2(T * input,T* output, int n, OP op)
 {
     int tid = threadIdx.x;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -130,7 +132,7 @@ __global__ void reduce_v2(const T * input,T* output, int n, OP op)
     {
         if( tid < stride )
         {
-            smem[index] = op(smem[tid], smem[tid + stride]);
+            smem[tid] = op(smem[tid], smem[tid + stride]);
         }
         __syncthreads();
     }
@@ -149,9 +151,13 @@ reduce_v3 有以下优点：
 */
 
 template <typename T, int BlockSize, typename OP>
-__global__ void reduce_v3(const T *input, T *output, int n, OP op) {
+__global__ void reduce_v3(T *input, T *output, int n, OP op) {
   int tid = threadIdx.x;
   int idx = threadIdx.x + blockIdx.x * (blockDim.x * 2);
+  if (idx >= n)
+  {
+      return;
+  }
   T *data = input + blockIdx.x * (blockDim.x * 2);
   __shared__ T smem[BlockSize];
   if(tid + blockDim.x < n) {
@@ -161,7 +167,7 @@ __global__ void reduce_v3(const T *input, T *output, int n, OP op) {
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
-      smem[index] = op(smem[tid], smem[tid + stride]);
+      smem[tid] = op(smem[tid], smem[tid + stride]);
     }
     __syncthreads();
   }
@@ -180,19 +186,22 @@ warp内，指令是SIMD同步, 在单个 warp 内，线程的执行是 SIMD 同�
 
 
 template <typename T, int BlockSize, typename OP>
-__global__ void reduce_v4(const T *input, T *output, int n, OP op) {
+__global__ void reduce_v4( T *input, T *output, int n, OP op) {
   int tid = threadIdx.x;
   int idx = threadIdx.x + blockIdx.x * (blockDim.x * 2);
-  T *data = input + blockIdx.x * (blockDim.x * 2);
+  if(idx>n) return;
   __shared__ T smem[BlockSize];
-  if(tid + blockDim.x < n) {
-    smem[tid] = op(data[tid], data[tid + blockDim.x]);
+
+  smem[tid] =input[idx];
+  if (idx + blockDim.x < n)
+  {
+      smem[tid] = op(smem[tid], input[idx + blockDim.x]);
   }
   __syncthreads();
 
   for (int stride = blockDim.x / 2; stride > 32; stride >>= 1) {
     if (tid < stride) {
-      smem[index] = op(smem[tid], smem[tid + stride]);
+      smem[tid] = op(smem[tid], smem[tid + stride]);
     }
     __syncthreads();
   }
@@ -213,10 +222,56 @@ __global__ void reduce_v4(const T *input, T *output, int n, OP op) {
 }
 
 
+template<typename T,typename OP>
+__device__ __forceinline__ T warpshulf(T val, OP op)
+{
+    for(int offset = warpSize/2; offset > 0; offset /= 2)
+    {
+        val = op(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+template<int BLOCK_SIZE,typename T,typename OP>
+__global__ void reduce_v5(T* input, T* output, int n, OP op)
+{
+    int tid = threadIdx.x;
+    int idx = threadIdx.x + blockIdx.x * blockDim.x*2;
+    int gridSize = BLOCK_SIZE * 2 * gridDim.x;
+    T* data = input + blockIdx.x * BLOCK_SIZE * 2;
+    T sum = data[tid];
+    while(idx < n)
+    {
+        sum = op(sum, data[tid + BLOCK_SIZE]);
+        idx += gridSize;
+    }
+
+    constexpr int warps = BLOCK_SIZE / 32;
+    static __shared__ T smem[warps];
+    sum = warpshulf(sum, op);
+
+    int lane = tid % warpSize;
+    int wid = tid / warpSize;
+    if(lane == 0) smem[wid] = sum;
+    __syncthreads();
+    
+    sum = (tid < warps) ? smem[tid] : 0;
+    if(wid == 0)
+    {
+        sum = warpshulf(sum, op);
+    }
+    if(tid == 0)
+    {
+        output[blockIdx.x] = sum;
+    }
+    
+}
+
+
 
 // Simple functor for summation
 struct AddOp {
-    __host__ __device__ float operator()(float a, float b) const {
+    __device__ __forceinline__ float operator()(float a, float b) const {
         return a + b;
     }
 };
@@ -228,6 +283,20 @@ static inline void checkCuda(cudaError_t err, const char* msg) {
         std::exit(EXIT_FAILURE);
     }
 }
+bool checkResult(const std::vector<float>& hOut,float hOutRef) {
+    // for (int i = 0; i < hOut.size(); i++) {
+    //     if (hOut[i] != hOutRef[i]) {
+    //         std::cerr << "Mismatch at index " << i << ": " << hOut[i] << " != " << hOutRef[i] << std::endl;
+    //         return false;
+    //     }
+    // }
+    float sum = std::accumulate(hOut.begin(), hOut.end(), 0.f);
+    if (std::abs(sum - hOutRef) > 1e-5) {
+        std::cerr << "Mismatch in sum: " << sum << " != " << hOutRef << std::endl;
+        return false;
+    }
+    return true;
+}
 
 void benchmarkKernels(int n, int blockSize) {
     // Host memory
@@ -236,6 +305,14 @@ void benchmarkKernels(int n, int blockSize) {
     std::uniform_real_distribution<float> dist(0.f, 1.f);
     for(int i = 0; i < n; i++)
         hIn[i] = dist(gen);
+
+    // Reference computation
+    auto timeStart = std::chrono::high_resolution_clock::now();
+    auto hOutRef = std::reduce(std::execution::par, hIn.begin(), hIn.end(), 0.f, std::plus<float>());
+    auto timeEnd = std::chrono::high_resolution_clock::now();
+    std::cout << "Reference sum: " << hOutRef << " took "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(timeEnd - timeStart).count()
+              << " ms" << std::endl;
 
     // Device memory
     float *dIn = nullptr, *dOut = nullptr;
@@ -259,6 +336,13 @@ void benchmarkKernels(int n, int blockSize) {
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
     };
+    auto checkKernalResult = [&](const char * label) {
+        cudaMemcpy(hOut.data(), dOut, hOut.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if(!checkResult(hOut, hOutRef)) {
+            std::cerr << "Mismatch in " << label << std::endl;
+        }
+        hOut.clear();
+    };
 
     // Grid size
     int gridSize = (n + blockSize - 1) / blockSize;
@@ -266,28 +350,53 @@ void benchmarkKernels(int n, int blockSize) {
     // Launch each kernel (names assumed from existing code)
     timeKernel([&](){
         reduce_basic<float, AddOp><<<gridSize, blockSize>>>(dIn, dOut, n, AddOp());
+        checkCuda(cudaGetLastError(), "Failed to launch reduce_basic");
         cudaDeviceSynchronize();
     }, "reduce_basic");
+    checkKernalResult("reduce_basic");
 
     timeKernel([&](){
         reduce_v1<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
+        checkCuda(cudaGetLastError(), "Failed to launch reduce_v1");
         cudaDeviceSynchronize();
     }, "reduce_v1");
+    checkKernalResult("reduce_v1");
 
     timeKernel([&](){
         reduce_v2<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
+        checkCuda(cudaGetLastError(), "Failed to launch reduce_v2");
         cudaDeviceSynchronize();
     }, "reduce_v2");
+    checkKernalResult("reduce_v2");
 
     timeKernel([&](){
-        reduce_v3<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
+        reduce_v3<float, 256, AddOp><<<gridSize/2, 256>>>(dIn, dOut, n, AddOp());
+        checkCuda(cudaGetLastError(), "Failed to launch reduce_v3");
         cudaDeviceSynchronize();
     }, "reduce_v3");
+    checkKernalResult("reduce_v3");
+
+    // timeKernel([&](){
+    //     dim3 gridDim(gridSize / 2);
+    //     dim3 blockDim(256);
+    //     reduce_v4<float, 256, AddOp><<<gridDim, blockDim>>>(dIn, dOut, n, AddOp());
+    //     checkCuda(cudaGetLastError(), "Failed to launch reduce_v4");
+    //     cudaDeviceSynchronize();
+    // }, "reduce_v4");
+    // cudaMemcpy(hOut.data(), dOut, hOut.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    // if(!checkResult(hOut, hOutRef)) {
+    //     std::cerr << "Mismatch in reduce_v4" << std::endl;
+    // }
+
 
     timeKernel([&](){
-        reduce_v4<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
+        reduce_v5<256, float, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
+        checkCuda(cudaGetLastError(), "Failed to launch reduce_v5");
         cudaDeviceSynchronize();
-    }, "reduce_v4");
+    }, "reduce_v5");
+    checkKernalResult("reduce_v5");
+
+
 
     // Cleanup
     cudaFree(dIn);
@@ -295,8 +404,9 @@ void benchmarkKernels(int n, int blockSize) {
 }
 
 int main() {
-    int n = 1 << 20;
+    int n =32*1024*1024;
     int blockSize = 256;
     benchmarkKernels(n, blockSize);
     return 0;
 }
+
