@@ -9,6 +9,11 @@ constexpr int BN = 64;
 constexpr int BK = 8;
 constexpr int TM = 8;
 
+
+// 增加单个线程的计算量，减少线程数
+// 一个线程负责TM个元素
+//dim3((BM*BN)/TM),  //block_size, each thread is responsible for TM elements
+//dim3(CEIL_DIV(m,BM),CEIL_DIV(n,BN)), //grid_size
 template <typename T>
 __global__ void sgemm_1D_Blocktiling(int m, int n, int k, T alpha, const T *A,
                                      const T *B, T beta, T *C) {
@@ -16,6 +21,7 @@ __global__ void sgemm_1D_Blocktiling(int m, int n, int k, T alpha, const T *A,
   const int bx = blockIdx.x;
   const int by = blockIdx.y;
 
+  // each blocktile is responsible for BM*BN elements
   const int totalResultsBlocktile = BM * BN;
   // a thread is reasponsible for TM  elements in the blocktile
   const int numThreadsBlocktile = totalResultsBlocktile / TM;

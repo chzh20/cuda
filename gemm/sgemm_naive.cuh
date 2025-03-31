@@ -32,16 +32,12 @@ __global__ void sgemm_naive1(int m, int n, int k, T alpha, const T*A, const T *B
     //int col = blockIdx.x * blockDim.x + threadIdx.x;
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int threadId = y*blockDim.x +x;
-    int warpId = threadId / 32;
-    int laneId = threadId % 32;
     if( x < m &&  y < n)
     {
         T result = 0;
         for (int i = 0; i < k; i++)
         {   
-            printf("threadId: %d, warpId: %d, laneId: %d,access: A[%d], address: %p\n", threadId, warpId, laneId, x * k + i, &A[x * k + i]);
+            //printf("threadId: %d, warpId: %d, laneId: %d,access: A[%d], address: %p\n", threadId, warpId, laneId, x * k + i, &A[x * k + i]);
             result += A[x * k + i] * B[i * n + y];
         }
         C[x * n + y] = alpha * result + beta * C[x * n + y];

@@ -245,7 +245,7 @@ void kernelTest(KernelFunc kernel,const char *kernelname, Config &config)
     // Calculate the number of floating-point operations per second (GFLOPS)
     float Gflops = (2.0 * m * n * k * 1.e-9) / (milliseconds / 1.0e3);
     std::cout << kernelname << " elapsed time: " << milliseconds << " ms " << "GFLOPS: " << Gflops << std::endl;
-    CUDACHECK(cudaFree(d_A));
+    CUDACHECK(cudaFree(d_A));        
     CUDACHECK(cudaFree(d_B));
     CUDACHECK(cudaFree(d_C));
 }
@@ -284,6 +284,14 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
     };
     cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
 
+    KernelConfig<Type> config0  {m, n, k, alpha, beta, 
+                                  dim3(32,32),  //block_size, each thread is responsible for TM elements
+                                  dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
+                                "sgemm_naive", A, B};
+    run_kernel(sgemm_naive,"sgemm_naive",config0); 
+    run_kernel(sgemm_naive1,"sgemm_naive1",config0);
+    run_kernel(sgemm_coalescing,"sgemm_coalescing",config0);   
+
     KernelConfig<Type> config1 {m, n, k, alpha, beta, 
                                   dim3((BM*BN)/TM),  //block_size, each thread is responsible for TM elements
                                   dim3(CEIL_DIV(m,BM),CEIL_DIV(n,BN)), //grid_size
@@ -293,11 +301,11 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
 
 
     KernelConfig<Type> config2  {m, n, k, alpha, beta, 
-                                  dim3(32,32),  //block_size, each thread is responsible for TM elements
+                                  dim3(32,32),  
                                   dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
-                                "sgemm_shared2", A, B};
-    config2.cudaSharedmemCarveoutMaxShared = true;
-    //run_kernel(sgemm_shared2,"sgemm_shared2",config2);
+                                "sgemm_shared", A, B};
+    run_kernel(sgemm_shared,"sgemm_shared",config2);
+    run_kernel(sgemm_shared2,"sgemm_shared2",config2);
     
     const int BM_2D = 128;
     const int BN_2D = 128;
@@ -335,7 +343,7 @@ void loopTest()
     std::array<uint,num> k = { 32, 64, 128, 256, 512, 1024, 2048,4096};
     float alpha = {1.0f};
     float beta = {1.0f};
-    for(int i =4;i< num; i++)
+    for(int i =7;i< num; i++)
     {
        printf("m=%d, n=%d, k=%d\n", m[i], n[i], k[i]);
        test(m[i], n[i], k[i], alpha, beta);

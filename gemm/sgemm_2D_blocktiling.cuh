@@ -3,7 +3,9 @@
 #include "device_launch_parameters.h"
 #include <cassert>
 #include <cstdio>
-
+#if defined(_WIN64) || defined(_WIN32) 
+#define uint unsigned int
+#endif
 
 template <typename T>
 __global__ void sgemm_2D_Blocktiling(int m, int n, int k, T alpha, const T *A,
