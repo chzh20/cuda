@@ -26,7 +26,7 @@ __global__ void sgemm_naive(int m, int n, int k, T alpha, const T*A, const T *B,
 }
 
 template<typename T>
-__global__ void sgemm_naive1(int m, int n, int k, T alpha, const T*A, const T *B, T beta,T*C)
+__global__ void sgemm_naive_tans(int m, int n, int k, T alpha, const T*A, const T *B, T beta,T*C)
 {
     //int row = blockIdx.y * blockDim.y + threadIdx.y;
     //int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,7 +37,6 @@ __global__ void sgemm_naive1(int m, int n, int k, T alpha, const T*A, const T *B
         T result = 0;
         for (int i = 0; i < k; i++)
         {   
-            //printf("threadId: %d, warpId: %d, laneId: %d,access: A[%d], address: %p\n", threadId, warpId, laneId, x * k + i, &A[x * k + i]);
             result += A[x * k + i] * B[i * n + y];
         }
         C[x * n + y] = alpha * result + beta * C[x * n + y];

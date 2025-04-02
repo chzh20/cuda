@@ -12,14 +12,17 @@
 #include"sgemm_1D_blocktiling.cuh"
 #include"sgemm_2D_blocktiling.cuh"
 #include"sgemm_warptilling.cuh"
+#include<fstream>
+#include<sstream>
+#include"Logger.h"
 
 
 template <typename T>
-T* gneraterandomMatrix(uint m, uint n)
+T* gneraterandomMatrix(uint m, uint n, uint seed = 0)
 {
     T *A = new T[m * n];
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(seed != 0 ? seed : rd());
     std::uniform_int_distribution<int> dis(0, 100);
     for (uint i = 0; i < m * n; i++)
     {
@@ -158,7 +161,9 @@ void cublas_test(int m, int n,int k, const T* A, T alpha, const T* B, T beta, T*
     //CUDACHECK(cudaDeviceSynchronize());
     T milliseconds = timer.stopTiming();
     float Gflops = (2.0 * m * n * k* 1.e-9)/ (milliseconds / 1.0e3);
-    std::cout << "cublas_sgemm elapsed time: " << milliseconds << " ms " << "GFLOPS: " << Gflops << std::endl;
+    
+    std::string log = "cublas_sgemm: elapsed time: " + std::to_string(milliseconds) + " ms " + " GFLOPS: " + std::to_string(Gflops);
+    Logger::getInstance().log(log);
     cublasDestroy(handle);
 
     CUDACHECK(cudaMemcpy(C, d_C, m * n * sizeof(T), cudaMemcpyDeviceToHost));
@@ -240,12 +245,14 @@ void kernelTest(KernelFunc kernel,const char *kernelname, Config &config)
     kernel<<<grid_size, block_size >>> (m, n, k, alpha, d_A, d_B, beta, d_C);
     CUDACHECK(cudaGetLastError());
     cudaDeviceSynchronize(); 
-    CUDACHECK(cudaMemcpy(config.C, d_C, m * n * sizeof(T), cudaMemcpyDeviceToHost));
     float milliseconds = timer.stopTiming();
+
+    CUDACHECK(cudaMemcpy(config.C, d_C, m * n * sizeof(T), cudaMemcpyDeviceToHost));
     // Calculate the number of floating-point operations per second (GFLOPS)
     float Gflops = (2.0 * m * n * k * 1.e-9) / (milliseconds / 1.0e3);
-    std::cout << kernelname << " elapsed time: " << milliseconds << " ms " << "GFLOPS: " << Gflops << std::endl;
-    CUDACHECK(cudaFree(d_A));        
+    std::string log =std::string(kernelname) + ": elapsed time: " + std::to_string(milliseconds) + " ms " + " GFLOPS: " + std::to_string(Gflops);
+    Logger::getInstance().log(log);
+    CUDACHECK(cudaFree(d_A));
     CUDACHECK(cudaFree(d_B));
     CUDACHECK(cudaFree(d_C));
 }
@@ -262,15 +269,13 @@ void kernelTest(KernelFunc kernel,const char *kernelname, Config &config)
 template<typename Type>
 void test(uint m, uint n, uint k, Type alpha, Type beta)
 {
-    Type *A = gneraterandomMatrix<Type>(m, k);
-    Type *B = gneraterandomMatrix<Type>(k, n);
+    Type *A = gneraterandomMatrix<Type>(m, k,1);
+    Type *B = gneraterandomMatrix<Type>(k, n,2);
     Type *C_cublas = new Type[m * n]{0.0f};
     Type *C_cpu = new Type[m * n]{0.0f};
-    //cpu_test<Type>(m, n, k, A, alpha, B, beta, C_cpu);
-    cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
-    using  KernelType = void(*)(int, int, int, Type, const Type*, const Type*, Type, Type*);
 
-    auto run_kernel=[&](KernelType kernel,const char *kernel_name,KernelConfig<Type> &config)
+    using  KernelType = void(*)(int, int, int, Type, const Type*, const Type*, Type, Type*);
+    auto run_kernel=[&](KernelType kernel,const char *kernel_name, KernelConfig<Type> &config)
     {
         Type *out_put = new Type[config.m * config.n]{0};
         config.C = out_put;
@@ -278,19 +283,34 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
         assert(config.B != nullptr);
         assert(config.C != nullptr);
         kernelTest<KernelType,Type>(kernel,kernel_name,config);
-        //CHECKRESULT(C_cublas, out_put, kernel_name,config.m * config.n);
-        //printMatrix(out_put,  m, n);
         delete[] out_put;
     };
+    // cublas test
     cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
 
-    KernelConfig<Type> config0  {m, n, k, alpha, beta, 
+
+    KernelConfig<Type> config_naive  {m, n, k, alpha, beta, 
                                   dim3(32,32),  //block_size, each thread is responsible for TM elements
                                   dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
                                 "sgemm_naive", A, B};
-    run_kernel(sgemm_naive,"sgemm_naive",config0); 
-    run_kernel(sgemm_naive1,"sgemm_naive1",config0);
-    run_kernel(sgemm_coalescing,"sgemm_coalescing",config0);   
+
+    run_kernel(sgemm_naive,"sgemm_naive",config_naive);
+
+    KernelConfig<Type> config_naive1  {m, n, k, alpha, beta, 
+        dim3(32,32),  //block_size, each thread is responsible for TM elements
+        dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
+      "sgemm_naive_tans", A, B};
+
+    run_kernel(sgemm_naive_tans,"sgemm_naive_tans",config_naive1);
+
+    KernelConfig<Type> config_naive2 {m, n, k, alpha, beta, 
+        dim3(32,32),  //block_size, each thread is responsible for TM elements
+        dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
+      "sgemm_coalescing", A, B};
+
+     run_kernel(sgemm_coalescing,"sgemm_coalescing",config_naive2);
+
+
 
     KernelConfig<Type> config1 {m, n, k, alpha, beta, 
                                   dim3((BM*BN)/TM),  //block_size, each thread is responsible for TM elements
@@ -301,10 +321,10 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
 
 
     KernelConfig<Type> config2  {m, n, k, alpha, beta, 
-                                  dim3(32,32),  
+                                  dim3(32*32),  //block_size, each thread is responsible for TM elements
                                   dim3(CEIL_DIV(m,32),CEIL_DIV(n,32)), //grid_size
-                                "sgemm_shared", A, B};
-    run_kernel(sgemm_shared,"sgemm_shared",config2);
+                                "sgemm_shared2", A, B};
+    //config2.cudaSharedmemCarveoutMaxShared = true;
     run_kernel(sgemm_shared2,"sgemm_shared2",config2);
     
     const int BM_2D = 128;
@@ -327,7 +347,7 @@ void test(uint m, uint n, uint k, Type alpha, Type beta)
     run_kernel(sgemm_Warptiling,"sgemm_Warptiling",config4);
 
 
-    //cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
+    cublas_test<Type>(m, n, k, A, alpha, B, beta, C_cublas);
     //CHECKRESULT(C_cpu, C_cublas,"cublas", m * n);
     delete[] A;
     delete[] B;
@@ -344,8 +364,11 @@ void loopTest()
     float alpha = {1.0f};
     float beta = {1.0f};
     for(int i =7;i< num; i++)
+    for(int i =7;i< num; i++)
     {
-       printf("m=%d, n=%d, k=%d\n", m[i], n[i], k[i]);
+       //printf("m=%d, n=%d, k=%d\n", m[i], n[i], k[i]);
+       std::string log = "Matrix Size: m=" + std::to_string(m[i]) + ", n=" + std::to_string(n[i]) + ", k=" + std::to_string(k[i]);
+       Logger::getInstance().log(log);
        test(m[i], n[i], k[i], alpha, beta);
     }
     //test(64, 64, 64, alpha, beta);
@@ -353,6 +376,7 @@ void loopTest()
 int main()
 {
     //CUDACHECK(cudaSetDevice(1));
+    Logger::getInstance().setFileName("sgemm_log.txt");
     printGPUInfo();
     loopTest();
     return 0;

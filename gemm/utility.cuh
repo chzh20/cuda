@@ -9,7 +9,7 @@
 #include<string>
 #include<random>
 #include<chrono>
-
+#include"Logger.h"
 template <typename T>
 void check(T result, const char *function, const char *file, size_t line)
 {

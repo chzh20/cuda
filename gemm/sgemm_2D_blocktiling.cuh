@@ -39,10 +39,17 @@ __global__ void sgemm_2D_Blocktiling(int m, int n, int k, T alpha, const T *A,
 
     const int innerRowA = threadIdx.x / BK;
     const int innerColA = threadIdx.x % BK;
+
+    //there are 128*8 elements in As; while only 256 threads
+	//the shape of block in A is (32,8),while can not cover all elements,
+	//so we need iterate along the row of A with strideA.
      //calculate the number of rows of Shared_A that are being loaded in one iteration
     const int strideA = numThreadsBlocktile/BK;
 
-
+    
+    //there are 8 * 128 elements in Bs; while only 256 threads
+	//the shape of thread block in B is (2,128),while can not cover all elements,
+	//so we need iterate along the row of B with strideB.
     const int innerRowB = threadIdx.x / BN;
     const int innerColB = threadIdx.x % BN;
     //calculate the number of rows of Shared_B that are being loaded in one iteration
@@ -69,7 +76,7 @@ __global__ void sgemm_2D_Blocktiling(int m, int n, int k, T alpha, const T *A,
         A += BK;
         B += BK * n;
 
-        for (uint dotIdx = 0; dotIdx< BK; ++dotIdx)
+        for (uint dotIdx = 0; dotIdx < BK; ++dotIdx)
         {
             for(uint i = 0; i<TM; ++i)
             {
@@ -96,6 +103,9 @@ __global__ void sgemm_2D_Blocktiling(int m, int n, int k, T alpha, const T *A,
     {
         for(int j =0; j<TN; ++j)
         {
+
+            //now we have the result of TM*TN elements in the blocktile
+            //we need to write it back to the global memory
             C[(threadRow * TM + i)*n + threadCol * TN + j] = alpha * threadResult[i*TN + j] + beta * C[(threadRow * TM + i)*n + threadCol * TN + j];
         }
     }

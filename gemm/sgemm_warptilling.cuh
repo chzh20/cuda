@@ -1,3 +1,4 @@
+
 #pragma once
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -5,6 +6,11 @@
 #include <cstdio>
 
 constexpr int NUM_THREADS = 128;
+/*
+BM: size of the block in the row dimension 
+
+
+*/
 
 template <typename T>
 __global__ void sgemm_Warptiling(int m, int n, int k, T alpha, const T *A,
@@ -25,8 +31,6 @@ __global__ void sgemm_Warptiling(int m, int n, int k, T alpha, const T *A,
     const int warpIdx = threadIdx.x / WARPSIZE;
     const int warpRow = warpIdx / (BN/WN);
     const int warpCol = warpIdx % (BN/WN);
-    
-
     //size of the warp subtile
     constexpr int WNITER = 2;
     constexpr int WMITER = (WM*WN)/(WARPSIZE*WNITER*TM*TN);

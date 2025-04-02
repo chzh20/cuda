@@ -1,6 +1,5 @@
 #include"cuda_runtime.h"
 #include"device_launch_parameters.h"
-#include <__clang_cuda_builtin_vars.h>
 #include <climits>
 #include <cstddef>
 #include<iostream>
@@ -458,6 +457,7 @@ __global__ void transposeMatrix_shared_unroll(T* odata, T* idata, size_t row, si
     { 
         if(x<col && y+i<row)
         {
+            //read UNROLL_FACTOR rows data one time  from global memory to shared memory
             tile[threadIdx.y+i][threadIdx.x] = idata[(y+i)*col+x];
         }
        
@@ -473,7 +473,7 @@ __global__ void transposeMatrix_shared_unroll(T* odata, T* idata, size_t row, si
         {
             odata[(y+i)*row + x] = tile[threadIdx.x][threadIdx.y+i];
         }
-        
+
     }
 }
 

@@ -46,7 +46,7 @@ public:
         auto result = task->get_future();
         {
             std::unique_lock<std::mutex> lock(mutex);
-            tasks.emplace([=](){(*task)();});
+            tasks.emplace([task](){(*task)();});
         }
         cv.notify_one();
         return result;

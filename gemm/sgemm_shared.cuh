@@ -17,26 +17,26 @@ __global__ void sgemm_shared(int m, int n, int k, T alpha, const T*A, const T *B
     float result = 0.0f;
  
     // Thread index
-    int tx = threadIdx.x; 
-    int ty = threadIdx.y;
+    int threadCol = threadIdx.x; 
+    int threadRow = threadIdx.y;
 
     // Calculate the row and column index of the element
-    int row = blockIdx.y * TILE_SIZE + ty;
-    int col = blockIdx.x * TILE_SIZE + tx;
+    int row = blockIdx.y * TILE_SIZE + threadRow;
+    int col = blockIdx.x * TILE_SIZE + threadCol;
 
     // Loop over tiles
     for(int i = 0; i < k; i += TILE_SIZE)
     {
         // Load tiles into shared memory
-        if (row < m && (i + tx) < k)
-            shared_A[ty][tx] = A[row * k + i + tx];
+        if (row < m && (i + threadCol) < k)
+            shared_A[threadRow][threadCol] = A[row * k + i + threadCol];
         else
-            shared_A[ty][tx] = 0.0f;
+            shared_A[threadRow][threadCol] = 0.0f;
 
-        if (col < n && (i + ty) < k)
-            shared_B[ty][tx] = B[(i + ty) * n + col];
+        if (col < n && (i + threadRow) < k)
+            shared_B[threadRow][threadCol] = B[(i + threadRow) * n + col];
         else
-            shared_B[ty][tx] = 0.0f;
+            shared_B[threadRow][threadCol] = 0.0f;
 
         // Synchronize to make sure the tiles are loaded
         __syncthreads();
@@ -44,7 +44,7 @@ __global__ void sgemm_shared(int m, int n, int k, T alpha, const T*A, const T *B
         // Compute partial product
         for(int j = 0; j < TILE_SIZE; j++)
         {
-            result += shared_A[ty][j] * shared_B[j][tx];
+            result += shared_A[threadRow][j] * shared_B[j][threadCol];
         }
 
         // Synchronize to make sure that computation is done before loading new tiles
@@ -58,12 +58,14 @@ __global__ void sgemm_shared(int m, int n, int k, T alpha, const T*A, const T *B
     }
 }
 
+
+
 template<typename T>
 __global__ void sgemm_shared2(int m, int n, int k, T alpha, const T*A, const T *B, T beta,T*C)
 {
     // Block index
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
+    const int cCol = blockIdx.x;
+    const int cRow = blockIdx.y;
 
     // Tile dimensions
     const int BM = TILE_SIZE;
@@ -75,13 +77,13 @@ __global__ void sgemm_shared2(int m, int n, int k, T alpha, const T*A, const T *
     __shared__ T shared_B[BK * BN];
 
     // Advance pointers to the start of the block
-    A += by * BM * k;  // advance A to point to the row of blocks, row = by * BM
-    B += bx * BN;  // advance B to point to the right block, col = bx * BN
-    C += by * BM * n + bx * BN; // advance C to point to the right block, row = by * BM, col = bx * BN
+    A += cRow * BM * k;  // advance A to point to the row of blocks, row = cRow * BM
+    B += cCol * BN;  // advance B to point to the right block, col = cCol * BN
+    C += cRow * BM * n + cCol * BN; // advance C to point to the right block, row = cRow * BM, col = cCol * BN
     
     // Thread index
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
+    const int threadRow = threadIdx.x / TILE_SIZE ;
+    const int threadCol = threadIdx.x % TILE_SIZE;
 
     // Initialize result
     T result = 0.0f;
@@ -90,8 +92,8 @@ __global__ void sgemm_shared2(int m, int n, int k, T alpha, const T*A, const T *
     for(int i = 0; i < k; i += BK)
     {   
         // Load tiles into shared memory
-        shared_A[ty * BK + tx] = A[ty * k + tx];
-        shared_B[ty * BK + tx] = B[ty * n + tx];
+        shared_A[threadRow * BK + threadCol] = A[threadRow * k + threadCol];
+        shared_B[threadRow * BN + threadCol] = B[threadRow * n + threadCol];
         __syncthreads();
         
         // Advance pointers to the next tile
@@ -101,11 +103,11 @@ __global__ void sgemm_shared2(int m, int n, int k, T alpha, const T*A, const T *
         // Compute partial product
         for(int j = 0; j < BK; j++)
         {
-            result += shared_A[ty * BK + j] * shared_B[j * BN + tx];
+            result += shared_A[threadRow * BK + j] * shared_B[j * BN + threadCol];
         }
         __syncthreads();
     }
 
     // Write the result to the output matrix
-    C[ty * n + tx] = alpha * result + beta * C[ty * n + tx];
+    C[threadRow * n + threadCol] = alpha * result + beta * C[threadRow * n + threadCol];
 }

@@ -4,9 +4,7 @@
 #include <vector>
 #include <chrono>
 #include <random>
-#include<execution>
-#include <algorithm>
-#include<numeric>
+
 
 /*
 
@@ -151,20 +149,15 @@ reduce_v3 有以下优点：
 */
 
 template <typename T, int BlockSize, typename OP>
-__global__ void reduce_v3(T *input, T *output, int n, OP op) {
+__global__ void reduce_v3(const T *input, T *output, int n, OP op) {
   int tid = threadIdx.x;
   int idx = threadIdx.x + blockIdx.x * (blockDim.x * 2);
-  if (idx >= n)
-  {
-      return;
-  }
   T *data = input + blockIdx.x * (blockDim.x * 2);
   __shared__ T smem[BlockSize];
   if(tid + blockDim.x < n) {
     smem[tid] = op(data[tid], data[tid + blockDim.x]);
   }
   __syncthreads();
-
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
       smem[tid] = op(smem[tid], smem[tid + stride]);
@@ -186,10 +179,10 @@ warp内，指令是SIMD同步, 在单个 warp 内，线程的执行是 SIMD 同�
 
 
 template <typename T, int BlockSize, typename OP>
-__global__ void reduce_v4( T *input, T *output, int n, OP op) {
+__global__ void reduce_v4(const T *input, T *output, int n, OP op) {
   int tid = threadIdx.x;
   int idx = threadIdx.x + blockIdx.x * (blockDim.x * 2);
-  if(idx>n) return;
+  T *data = input + blockIdx.x * (blockDim.x * 2);
   __shared__ T smem[BlockSize];
 
   smem[tid] =input[idx];
@@ -283,20 +276,6 @@ static inline void checkCuda(cudaError_t err, const char* msg) {
         std::exit(EXIT_FAILURE);
     }
 }
-bool checkResult(const std::vector<float>& hOut,float hOutRef) {
-    // for (int i = 0; i < hOut.size(); i++) {
-    //     if (hOut[i] != hOutRef[i]) {
-    //         std::cerr << "Mismatch at index " << i << ": " << hOut[i] << " != " << hOutRef[i] << std::endl;
-    //         return false;
-    //     }
-    // }
-    float sum = std::accumulate(hOut.begin(), hOut.end(), 0.f);
-    if (std::abs(sum - hOutRef) > 1e-5) {
-        std::cerr << "Mismatch in sum: " << sum << " != " << hOutRef << std::endl;
-        return false;
-    }
-    return true;
-}
 
 void benchmarkKernels(int n, int blockSize) {
     // Host memory
@@ -305,14 +284,6 @@ void benchmarkKernels(int n, int blockSize) {
     std::uniform_real_distribution<float> dist(0.f, 1.f);
     for(int i = 0; i < n; i++)
         hIn[i] = dist(gen);
-
-    // Reference computation
-    auto timeStart = std::chrono::high_resolution_clock::now();
-    auto hOutRef = std::reduce(std::execution::par, hIn.begin(), hIn.end(), 0.f, std::plus<float>());
-    auto timeEnd = std::chrono::high_resolution_clock::now();
-    std::cout << "Reference sum: " << hOutRef << " took "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(timeEnd - timeStart).count()
-              << " ms" << std::endl;
 
     // Device memory
     float *dIn = nullptr, *dOut = nullptr;
@@ -336,13 +307,6 @@ void benchmarkKernels(int n, int blockSize) {
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
     };
-    auto checkKernalResult = [&](const char * label) {
-        cudaMemcpy(hOut.data(), dOut, hOut.size() * sizeof(float), cudaMemcpyDeviceToHost);
-        if(!checkResult(hOut, hOutRef)) {
-            std::cerr << "Mismatch in " << label << std::endl;
-        }
-        hOut.clear();
-    };
 
     // Grid size
     int gridSize = (n + blockSize - 1) / blockSize;
@@ -350,62 +314,61 @@ void benchmarkKernels(int n, int blockSize) {
     // Launch each kernel (names assumed from existing code)
     timeKernel([&](){
         reduce_basic<float, AddOp><<<gridSize, blockSize>>>(dIn, dOut, n, AddOp());
-        checkCuda(cudaGetLastError(), "Failed to launch reduce_basic");
         cudaDeviceSynchronize();
     }, "reduce_basic");
-    checkKernalResult("reduce_basic");
 
     timeKernel([&](){
         reduce_v1<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
         checkCuda(cudaGetLastError(), "Failed to launch reduce_v1");
         cudaDeviceSynchronize();
     }, "reduce_v1");
-    checkKernalResult("reduce_v1");
 
     timeKernel([&](){
         reduce_v2<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
-        checkCuda(cudaGetLastError(), "Failed to launch reduce_v2");
         cudaDeviceSynchronize();
     }, "reduce_v2");
-    checkKernalResult("reduce_v2");
 
     timeKernel([&](){
         reduce_v3<float, 256, AddOp><<<gridSize/2, 256>>>(dIn, dOut, n, AddOp());
         checkCuda(cudaGetLastError(), "Failed to launch reduce_v3");
         cudaDeviceSynchronize();
     }, "reduce_v3");
-    checkKernalResult("reduce_v3");
-
-    // timeKernel([&](){
-    //     dim3 gridDim(gridSize / 2);
-    //     dim3 blockDim(256);
-    //     reduce_v4<float, 256, AddOp><<<gridDim, blockDim>>>(dIn, dOut, n, AddOp());
-    //     checkCuda(cudaGetLastError(), "Failed to launch reduce_v4");
-    //     cudaDeviceSynchronize();
-    // }, "reduce_v4");
-    // cudaMemcpy(hOut.data(), dOut, hOut.size() * sizeof(float), cudaMemcpyDeviceToHost);
-    // if(!checkResult(hOut, hOutRef)) {
-    //     std::cerr << "Mismatch in reduce_v4" << std::endl;
-    // }
-
 
     timeKernel([&](){
-        reduce_v5<256, float, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
-        checkCuda(cudaGetLastError(), "Failed to launch reduce_v5");
+        reduce_v4<float, 256, AddOp><<<gridSize, 256>>>(dIn, dOut, n, AddOp());
         cudaDeviceSynchronize();
-    }, "reduce_v5");
-    checkKernalResult("reduce_v5");
-
-
+    }, "reduce_v4");
 
     // Cleanup
     cudaFree(dIn);
     cudaFree(dOut);
 }
 
+void printGPUInfo() {
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+
+    for (int i = 0; i < deviceCount; ++i) {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, i);
+
+        std::cout << "Device " << i << ": " << deviceProp.name << std::endl;
+        std::cout << "Compute Capability: " << deviceProp.major << "." << deviceProp.minor << std::endl;
+        std::cout << "Total Global Memory: " << deviceProp.totalGlobalMem / (1024 * 1024) << " MB" << std::endl;
+        std::cout << "Shared Memory per Block: " << deviceProp.sharedMemPerBlock / 1024 << " KB" << std::endl;
+        std::cout << "Max Threads per Block: " << deviceProp.maxThreadsPerBlock << std::endl;
+        std::cout << "Max Block Dimensions: (" << deviceProp.maxThreadsDim[0] << ", " << deviceProp.maxThreadsDim[1] << ", " << deviceProp.maxThreadsDim[2] << ")" << std::endl;
+        std::cout << "Max Grid Dimensions: (" << deviceProp.maxGridSize[0] << ", " << deviceProp.maxGridSize[1] << ", " << deviceProp.maxGridSize[2] << ")" << std::endl;
+        std::cout << std::endl;
+    }
+}
+
+
+
 int main() {
-    int n =32*1024*1024;
+    int n = 1 << 20;
     int blockSize = 256;
+    printGPUInfo();
     benchmarkKernels(n, blockSize);
     return 0;
 }
